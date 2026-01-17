@@ -1,0 +1,7 @@
+# Secrets
+.env
+cookies.txt
+
+# Media files (optional, if you don't want to upload mp3s to git)
+media/
+__pycache__/
