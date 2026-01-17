@@ -128,20 +128,38 @@ async def play(ctx, *, query):
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def yt(ctx, *, query):
-    """Plays from YOUTUBE (Admin Only)."""
+    """Plays from YouTube (Url or Search) - Admin Only."""
     if not ctx.voice_client:
         if ctx.author.voice: await ctx.author.voice.channel.connect()
         else: return await ctx.send("Join a voice channel first.")
 
-    await ctx.send(f"🔎 Searching YouTube for: **{query}**...")
+    # 1. Determine if the user provided a LINK or a SEARCH PHRASE
+    # We check if it starts with http or www
+    if query.startswith(("http://", "https://", "www.")):
+        search_query = query
+        await ctx.send(f"🔗 Loading Link...")
+    else:
+        search_query = f"ytsearch:{query}"
+        await ctx.send(f"🔎 Searching YouTube for: **{query}**...")
 
     try:
         with yt_dlp.YoutubeDL(settings.YTDL_OPTIONS) as ydl:
-            info = ydl.extract_info(f"ytsearch:{query}", download=False)
-            if 'entries' in info: info = info['entries'][0]
+            # 2. Extract Info
+            info = ydl.extract_info(search_query, download=False)
             
-            url = info['url']
-            title = info['title']
+            # 3. Handle Search Results vs Direct Links
+            # If it was a 'ytsearch:', the result is a playlist (list of entries).
+            # If it was a direct URL, it might be a single dict OR a playlist.
+            if 'entries' in info:
+                # If it's a list, take the first item
+                # (This handles both search results and playlist links)
+                video_data = info['entries'][0]
+            else:
+                # It's a direct video file
+                video_data = info
+            
+            url = video_data['url']
+            title = video_data['title']
             
             song_obj = {'type': 'url', 'title': title, 'data': url}
             song_queue.append(song_obj)
@@ -150,8 +168,9 @@ async def yt(ctx, *, query):
                 await play_next(ctx)
             else:
                 await ctx.send(f"✅ Added to queue: `{title}`")
+
     except Exception as e:
-        await ctx.send(f"Error: {e}")
+        await ctx.send(f"❌ Error: {e}")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -178,6 +197,61 @@ async def skip(ctx):
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.stop()
         await ctx.send("⏭️ Skipped.")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def queue(ctx):
+    """Lists the current queue."""
+    if not song_queue:
+        await ctx.send("The queue is currently empty.")
+        return
+
+    # Build the string
+    queue_list = "**Upcoming Songs:**\n"
+    for i, song in enumerate(song_queue):
+        # i+1 makes it human readable (1, 2, 3 instead of 0, 1, 2)
+        queue_list += f"`{i+1}.` {song['title']}\n"
+
+    # Discord has a message limit of 2000 chars. 
+    # If queue is huge, just show the first 10.
+    if len(queue_list) > 1900:
+        await ctx.send(f"{queue_list[:1900]}...\n*(and more)*")
+    else:
+        await ctx.send(queue_list)
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def skipto(ctx, index: int):
+    """Skips to a specific number in the queue."""
+    global song_queue
+    
+    if not ctx.voice_client or not ctx.voice_client.is_playing():
+        await ctx.send("Nothing is playing right now.")
+        return
+
+    if not song_queue:
+        await ctx.send("The queue is empty.")
+        return
+
+    # Validate the number
+    if index < 1 or index > len(song_queue):
+        await ctx.send(f"Invalid number. Please choose between 1 and {len(song_queue)}.")
+        return
+
+    # Logic: Slice the queue to remove everything BEFORE the target
+    # index-1 because users see 1-based, list is 0-based
+    song_queue = song_queue[index-1:]
+
+    # Stop the current song. This triggers 'play_next', which pulls from our NEW shortened queue.
+    ctx.voice_client.stop()
+    await ctx.send(f"⏭️ Skipped to position **{index}**.")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def clear(ctx):
+    """Clears all upcoming songs in the queue."""
+    song_queue.clear()
+    await ctx.send("🗑️ **Queue cleared.**")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
