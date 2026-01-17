@@ -71,6 +71,16 @@ async def on_ready():
     print(f'Media Folder: {settings.MEDIA_FOLDER}')
 
 @bot.command()
+async def join(ctx):
+    """Joins the voice channel."""
+    if ctx.author.voice:
+        channel = ctx.author.voice.channel
+        await channel.connect()
+        await ctx.send(f"👋 Joined **{channel}**")
+    else:
+        await ctx.send("You need to be in a voice channel first.")
+
+@bot.command()
 async def play(ctx, *, query):
     """Plays a LOCAL file (Smart Search)."""
     if not ctx.voice_client:
