@@ -9,16 +9,11 @@ COMMAND_PREFIX = '!'
 YTDL_OPTIONS = {
     'format': 'bestaudio/best',
     'noplaylist': True,
-    # 'cookiefile': 'cookies.txt', 
-    'quiet': True,
-    'nocheckcertificate': True,
-    'ignoreerrors': False,
-    'logtostderr': False,
-    'quiet': True,
-    'no_warnings': True,
+    'quiet': False,
+    'no_warnings': False,
     'default_search': 'auto',
     'source_address': '0.0.0.0',
-    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
+    'geo_bypass': True,
 }
 
 # FFmpeg Options

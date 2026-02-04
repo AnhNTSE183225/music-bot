@@ -6,6 +6,16 @@ import yt_dlp
 import difflib
 from dotenv import load_dotenv
 import settings
+import traceback
+import logging
+
+# Enable debug logging
+logging.basicConfig(level=logging.DEBUG)
+
+# Also log to file
+file_handler = logging.FileHandler('debug.log')
+file_handler.setLevel(logging.DEBUG)
+logging.getLogger().addHandler(file_handler)
 
 # Load Secrets
 load_dotenv()
@@ -17,11 +27,36 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix=settings.COMMAND_PREFIX, intents=intents)
 
+# YouTube / YTDL Options
+YTDL_FORMAT_OPTIONS = {
+    'format': 'bestaudio/best',
+    'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
+    'restrictfilenames': True,
+    'noplaylist': True,
+    'nocheckcertificate': True,
+    'ignoreerrors': False,
+    'logtostderr': False,
+    'quiet': True,
+    'no_warnings': True,
+    'default_search': 'auto',
+    'source_address': '0.0.0.0',
+    'extractor_args': {'youtube': {'player_client': ['android']}},
+}
+
+FFMPEG_OPTIONS = {
+    'options': '-vn',
+}
+
+FFMPEG_OPTIONS = {
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+    'options': '-vn',
+}
+
+ytdl = yt_dlp.YoutubeDL(YTDL_FORMAT_OPTIONS)
+
 # GLOBAL VARIABLES
 song_queue = []
 current_volume = 1  # Default volume (0.5 = 50%)
-
-# --- HELPER FUNCTIONS ---
 
 def find_best_match(query):
     """Smart search for local files."""
@@ -50,12 +85,33 @@ async def play_next(ctx):
         song = song_queue.pop(0)
         
         try:
+            print(f"🔴 DEBUG: Now playing - {song['type']}: {song['title']}")
             # 1. Create the base Source
             if song['type'] == 'local':
                 source_path = os.path.join(settings.MEDIA_FOLDER, song['data'])
                 source = discord.FFmpegPCMAudio(source_path)
+            elif song['type'] == 'youtube':
+                print(f"🔴 DEBUG: Creating FFmpeg source for YouTube")
+                
+                # Use discord.py's recommended approach with loop
+                loop = asyncio.get_event_loop()
+                data = await loop.run_in_executor(None, lambda: ytdl.extract_info(song['data'], download=False))
+                
+                if 'entries' in data:
+                    data = data['entries'][0]
+                
+                filename = data['url']
+                print(f"🔴 DEBUG: Stream URL obtained: {filename[:100]}")
+                print(f"🔴 DEBUG: Format: {data.get('format_id')}, ext: {data.get('ext')}")
+                
+                source = discord.FFmpegPCMAudio(filename, **FFMPEG_OPTIONS)
             elif song['type'] == 'url':
-                source = discord.FFmpegPCMAudio(song['data'], **settings.FFMPEG_OPTIONS)
+                print(f"🔴 DEBUG: Creating FFmpeg source for generic URL")
+                source = discord.FFmpegPCMAudio(
+                    song['data'],
+                    before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+                    options="-vn"
+                )
 
             # 2. Apply Volume Transformer
             # This wrapper allows us to change volume
@@ -71,6 +127,8 @@ async def play_next(ctx):
             await ctx.send(f"🎶 **Now Playing:** {song['title']} (Vol: {int(current_volume * 100)}%)")
         
         except Exception as e:
+            print(f"🔴 DEBUG ERROR in play_next:")
+            print(traceback.format_exc())
             await ctx.send(f"❌ Error playing next song: {e}")
             await play_next(ctx) # Try the next one
     else:
@@ -143,33 +201,36 @@ async def yt(ctx, *, query):
         await ctx.send(f"🔎 Searching YouTube for: **{query}**...")
 
     try:
-        with yt_dlp.YoutubeDL(settings.YTDL_OPTIONS) as ydl:
-            # 2. Extract Info
-            info = ydl.extract_info(search_query, download=False)
-            
-            # 3. Handle Search Results vs Direct Links
-            # If it was a 'ytsearch:', the result is a playlist (list of entries).
-            # If it was a direct URL, it might be a single dict OR a playlist.
-            if 'entries' in info:
-                # If it's a list, take the first item
-                # (This handles both search results and playlist links)
-                video_data = info['entries'][0]
-            else:
-                # It's a direct video file
-                video_data = info
-            
-            url = video_data['url']
-            title = video_data['title']
-            
-            song_obj = {'type': 'url', 'title': title, 'data': url}
-            song_queue.append(song_obj)
+        data = ytdl.extract_info(search_query, download=False)
+        
+        # 3. Handle Search Results vs Direct Links
+        if 'entries' in data:
+            video_data = data['entries'][0]
+        else:
+            video_data = data
+        
+        title = video_data['title']
+        # Use webpage_url - this will be processed by yt-dlp again during playback
+        webpage_url = video_data.get('webpage_url') or video_data.get('url')
+        
+        if not webpage_url:
+            print(f"🔴 DEBUG: No URL found. Available keys: {video_data.keys()}")
+            return await ctx.send("❌ Error: Could not extract URL from video.")
+        
+        print(f"🔴 DEBUG: Using webpage URL: {webpage_url}")
+        
+        song_obj = {'type': 'youtube', 'title': title, 'data': webpage_url}
+        song_queue.append(song_obj)
+        print(f"🔴 DEBUG: Added song to queue - Title: {title}")
 
-            if not ctx.voice_client.is_playing():
-                await play_next(ctx)
-            else:
-                await ctx.send(f"✅ Added to queue: `{title}`")
+        if not ctx.voice_client.is_playing():
+            await play_next(ctx)
+        else:
+            await ctx.send(f"✅ Added to queue: `{title}`")
 
     except Exception as e:
+        print(f"🔴 DEBUG ERROR in yt command:")
+        print(traceback.format_exc())
         await ctx.send(f"❌ Error: {e}")
 
 @bot.command()
