@@ -56,7 +56,7 @@ ytdl = yt_dlp.YoutubeDL(YTDL_FORMAT_OPTIONS)
 
 # GLOBAL VARIABLES
 song_queue = []
-current_volume = 1  # Default volume (0.5 = 50%)
+current_volume = 0.01  # Default volume (0.5 = 50%)
 
 def find_best_match(query):
     """Smart search for local files."""
