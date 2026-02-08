@@ -1,5 +1,5 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import os
 import asyncio
 import yt_dlp
@@ -8,6 +8,8 @@ from dotenv import load_dotenv
 import settings
 import traceback
 import logging
+import socket
+import subprocess
 
 # Enable debug logging
 logging.basicConfig(level=logging.DEBUG)
@@ -56,7 +58,9 @@ ytdl = yt_dlp.YoutubeDL(YTDL_FORMAT_OPTIONS)
 
 # GLOBAL VARIABLES
 song_queue = []
-current_volume = 0.01  # Default volume (0.5 = 50%)
+current_volume = 0.5  # Default volume (0.5 = 50%)
+minecraft_server_online = False
+minecraft_server_ip = None
 
 def find_best_match(query):
     """Smart search for local files."""
@@ -139,14 +143,14 @@ async def play_next(ctx):
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user}')
-    print('Administrator mode: ON')
+    print('Administrator mode: OFF')
+    check_minecraft_server.start()  # Start background task
+    print('Minecraft server monitoring started')
 
 @bot.event
 async def on_command_error(ctx, error):
     """Handles permission errors nicely."""
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send("🚫 **Access Denied:** You need `Administrator` permission to use this bot.")
-    elif isinstance(error, commands.CommandNotFound):
+    if isinstance(error, commands.CommandNotFound):
         pass # Ignore invalid commands
     else:
         await ctx.send(f"❌ An error occurred: {error}")
@@ -154,7 +158,6 @@ async def on_command_error(ctx, error):
 # --- COMMANDS ---
 
 @bot.command()
-@commands.has_permissions(administrator=True)
 async def join(ctx):
     if ctx.author.voice:
         channel = ctx.author.voice.channel
@@ -164,9 +167,8 @@ async def join(ctx):
         await ctx.send("You need to be in a voice channel first.")
 
 @bot.command()
-@commands.has_permissions(administrator=True)
 async def play(ctx, *, query):
-    """Plays LOCAL file (Admin Only)."""
+    """Plays LOCAL file."""
     if not ctx.voice_client:
         if ctx.author.voice: await ctx.author.voice.channel.connect()
         else: return await ctx.send("Join a voice channel first.")
@@ -184,9 +186,8 @@ async def play(ctx, *, query):
         await ctx.send(f"✅ Added to queue: `{filename}`")
 
 @bot.command()
-@commands.has_permissions(administrator=True)
 async def yt(ctx, *, query):
-    """Plays from YouTube (Url or Search) - Admin Only."""
+    """Plays from YouTube (Url or Search)."""
     if not ctx.voice_client:
         if ctx.author.voice: await ctx.author.voice.channel.connect()
         else: return await ctx.send("Join a voice channel first.")
@@ -234,7 +235,6 @@ async def yt(ctx, *, query):
         await ctx.send(f"❌ Error: {e}")
 
 @bot.command()
-@commands.has_permissions(administrator=True)
 async def volume(ctx, volume: int):
     """Sets volume (0-100)."""
     global current_volume
@@ -253,14 +253,13 @@ async def volume(ctx, volume: int):
     await ctx.send(f"🔊 Volume set to **{volume}%**")
 
 @bot.command()
-@commands.has_permissions(administrator=True)
+
 async def skip(ctx):
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.stop()
         await ctx.send("⏭️ Skipped.")
 
 @bot.command()
-@commands.has_permissions(administrator=True)
 async def queue(ctx):
     """Lists the current queue."""
     if not song_queue:
@@ -281,7 +280,6 @@ async def queue(ctx):
         await ctx.send(queue_list)
 
 @bot.command()
-@commands.has_permissions(administrator=True)
 async def skipto(ctx, index: int):
     """Skips to a specific number in the queue."""
     global song_queue
@@ -308,19 +306,115 @@ async def skipto(ctx, index: int):
     await ctx.send(f"⏭️ Skipped to position **{index}**.")
 
 @bot.command()
-@commands.has_permissions(administrator=True)
 async def clear(ctx):
     """Clears all upcoming songs in the queue."""
     song_queue.clear()
     await ctx.send("🗑️ **Queue cleared.**")
 
 @bot.command()
-@commands.has_permissions(administrator=True)
 async def stop(ctx):
     song_queue.clear()
     if ctx.voice_client:
         ctx.voice_client.stop()
         await ctx.voice_client.disconnect()
         await ctx.send("🛑 Stopped.")
+
+@bot.command()
+async def minecraft(ctx):
+    """Returns Minecraft server connection info."""
+    global minecraft_server_ip, minecraft_server_online
+    
+    if minecraft_server_ip is None:
+        await ctx.send("🔄 Fetching server information...")
+        # Try to get IP
+        try:
+            result = subprocess.run(
+                ['curl', 'ipv4.icanhazip.com'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                minecraft_server_ip = result.stdout.strip()
+            else:
+                return await ctx.send("❌ Could not fetch public IP address.")
+        except Exception as e:
+            return await ctx.send(f"❌ Error fetching IP: {e}")
+    
+    server_address = f"{minecraft_server_ip}:25565"
+    status_emoji = "🟢" if minecraft_server_online else "🔴"
+    status_text = "Online" if minecraft_server_online else "Offline"
+    
+    embed = discord.Embed(
+        title="🎮 Minecraft Server",
+        description=f"{status_emoji} Status: **{status_text}**",
+        color=discord.Color.green() if minecraft_server_online else discord.Color.red()
+    )
+    embed.add_field(name="Server Address", value=f"`{server_address}`", inline=False)
+    embed.add_field(name="Connect", value=f"Use this address in Minecraft to join!", inline=False)
+    
+    await ctx.send(embed=embed)
+
+# Background task to check Minecraft server status
+@tasks.loop(seconds=60)
+async def check_minecraft_server():
+    """Checks if Minecraft server is online and updates bot status."""
+    global minecraft_server_online, minecraft_server_ip
+    
+    # Get public IP if not already cached
+    if minecraft_server_ip is None:
+        try:
+            result = subprocess.run(
+                ['curl', 'ipv4.icanhazip.com'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                minecraft_server_ip = result.stdout.strip()
+                print(f"📡 Detected public IP: {minecraft_server_ip}")
+        except Exception as e:
+            print(f"❌ Error fetching public IP: {e}")
+            minecraft_server_ip = "localhost"  # Fallback
+    
+    # Check if server is online by attempting socket connection
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        # Try to connect to localhost on port 25565
+        result = sock.connect_ex(('localhost', 25565))
+        sock.close()
+        
+        was_online = minecraft_server_online
+        minecraft_server_online = (result == 0)
+        
+        # Update bot status
+        if minecraft_server_online:
+            await bot.change_presence(
+                activity=discord.Game(name="Minecraft: Online 🟢"),
+                status=discord.Status.online
+            )
+            if not was_online:
+                print("✅ Minecraft server is now ONLINE")
+        else:
+            await bot.change_presence(
+                activity=discord.Game(name="Minecraft: Offline 🔴"),
+                status=discord.Status.idle
+            )
+            if was_online:
+                print("⚠️ Minecraft server is now OFFLINE")
+    
+    except Exception as e:
+        print(f"❌ Error checking Minecraft server: {e}")
+        minecraft_server_online = False
+        await bot.change_presence(
+            activity=discord.Game(name="Minecraft: Unknown ⚪"),
+            status=discord.Status.idle
+        )
+
+@check_minecraft_server.before_loop
+async def before_check_server():
+    """Wait for bot to be ready before starting the loop."""
+    await bot.wait_until_ready()
 
 bot.run(TOKEN)
