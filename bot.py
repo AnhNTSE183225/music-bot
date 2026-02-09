@@ -342,6 +342,7 @@ async def minecraft(ctx):
             return await ctx.send(f"❌ Error fetching IP: {e}")
     
     server_address = f"{minecraft_server_ip}:25565"
+    map_url = f"http://{minecraft_server_ip}:8080"
     status_emoji = "🟢" if minecraft_server_online else "🔴"
     status_text = "Online" if minecraft_server_online else "Offline"
     
@@ -351,6 +352,7 @@ async def minecraft(ctx):
         color=discord.Color.green() if minecraft_server_online else discord.Color.red()
     )
     embed.add_field(name="Server Address", value=f"`{server_address}`", inline=False)
+    embed.add_field(name="Map URL", value=f"[View Map]({map_url})", inline=False)
     embed.add_field(name="Connect", value=f"Use this address in Minecraft to join!", inline=False)
     
     await ctx.send(embed=embed)
