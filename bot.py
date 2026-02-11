@@ -10,6 +10,7 @@ import traceback
 import logging
 import socket
 import subprocess
+from datetime import datetime, timedelta, timezone
 
 # Enable debug logging
 logging.basicConfig(level=logging.DEBUG)
@@ -61,6 +62,81 @@ song_queue = []
 current_volume = 0.5  # Default volume (0.5 = 50%)
 minecraft_server_online = False
 minecraft_server_ip = None
+
+def calculate_relative_time(date_string):
+    """Calculate relative time from YYYY-MM-DD-HH-MM format (GMT+7)."""
+    try:
+        # Parse the date string
+        date_obj = datetime.strptime(date_string, '%Y-%m-%d-%H-%M')
+        
+        # Get current time in GMT+7 (using timezone-aware datetime)
+        gmt7 = timezone(timedelta(hours=7))
+        current_time = datetime.now(timezone.utc).astimezone(gmt7).replace(tzinfo=None)
+        
+        # Calculate difference
+        diff = current_time - date_obj
+        
+        # Convert to appropriate unit
+        total_seconds = diff.total_seconds()
+        
+        if total_seconds < 60:
+            return "<1 minute ago"
+        elif total_seconds < 3600:  # Less than 1 hour
+            minutes = int(total_seconds / 60)
+            return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+        elif total_seconds < 86400:  # Less than 24 hours
+            hours = int(total_seconds / 3600)
+            return f"{hours} hour{'s' if hours != 1 else ''} ago"
+        else:  # 24 hours or more
+            days = int(total_seconds / 86400)
+            return f"{days} day{'s' if days != 1 else ''} ago"
+    except Exception as e:
+        return "Unknown"
+
+def load_minecraft_template():
+    """Load the Minecraft message template from file."""
+    template = {}
+    try:
+        with open('minecraft_message.txt', 'r', encoding='utf-8') as f:
+            content = f.read()
+            # Parse sections - find [KEY] at start of line
+            import re
+            pattern = r'^\[([^\]]+)\]\s*\n((?:(?!\n\[)[^\n]*\n?)*)'
+            matches = re.finditer(pattern, content, re.MULTILINE)
+            for match in matches:
+                key = match.group(1).strip()
+                value = match.group(2).strip()
+                template[key] = value
+    except FileNotFoundError:
+        # Return default template if file doesn't exist
+        template = {
+            'LOADING_MESSAGE': '🔄 Fetching server information...',
+            'ERROR_NO_IP': '❌ Could not fetch public IP address.',
+            'ERROR_EXCEPTION': '❌ Error fetching IP: {error}',
+            'EMBED_TITLE': '🎮 Minecraft Server',
+            'EMBED_DESCRIPTION': '{statusEmoji} Status: **{statusText}**',
+            'FIELD_1_NAME': 'Server Address',
+            'FIELD_1_VALUE': '`{serverAddress}`',
+            'FIELD_2_NAME': 'Map URL',
+            'FIELD_2_VALUE': '[View Map]({mapUrl})',
+            'FIELD_3_NAME': '📅 CLIENT LAST UPDATED',
+            'FIELD_3_VALUE': '**🕒 {lastUpdated}**',
+            'FIELD_4_NAME': 'Latest Client Version',
+            'FIELD_4_VALUE': '**{versionName}**\n{versionDescription}',
+            'FIELD_5_NAME': 'Download Client',
+            'FIELD_5_VALUE': '[Google Drive Link]({driveLink})',
+            'FIELD_6_NAME': 'Instructions',
+            'FIELD_6_VALUE': '{instructions}',
+            'VERSION_NAME': '1.20.1',
+            'VERSION_DESCRIPTION': 'Forge modded client with performance mods',
+            'DRIVE_LINK': 'https://drive.google.com/your-link-here',
+            'INSTRUCTIONS': '1. Download the client from the link above\n2. Extract to your Minecraft folder\n3. Run the launcher and connect!',
+            'LAST_UPDATED_DATE': '2026-02-12-14-30',
+            'BOT_STATUS_TYPE': 'playing',
+            'BOT_STATUS_TEXT': 'Type !minecraft for server info',
+            'BOT_STATUS_STATE': 'online',
+        }
+    return template
 
 def find_best_match(query):
     """Smart search for local files."""
@@ -140,12 +216,45 @@ async def play_next(ctx):
 
 # --- EVENTS ---
 
+async def set_bot_status():
+    """Set bot status from template."""
+    template = load_minecraft_template()
+    status_type = template.get('BOT_STATUS_TYPE', 'playing').lower()
+    status_text = template.get('BOT_STATUS_TEXT', 'Type !help for commands')
+    status_state = template.get('BOT_STATUS_STATE', 'online').lower()
+    
+    # Map activity types
+    if status_type == 'playing':
+        activity = discord.Game(name=status_text)
+    elif status_type == 'listening':
+        activity = discord.Activity(type=discord.ActivityType.listening, name=status_text)
+    elif status_type == 'watching':
+        activity = discord.Activity(type=discord.ActivityType.watching, name=status_text)
+    elif status_type == 'streaming':
+        activity = discord.Streaming(name=status_text, url="https://twitch.tv/placeholder")
+    else:
+        activity = discord.Game(name=status_text)
+    
+    # Map status states
+    if status_state == 'online':
+        discord_status = discord.Status.online
+    elif status_state == 'idle':
+        discord_status = discord.Status.idle
+    elif status_state == 'dnd' or status_state == 'do_not_disturb':
+        discord_status = discord.Status.dnd
+    elif status_state == 'invisible':
+        discord_status = discord.Status.invisible
+    else:
+        discord_status = discord.Status.online
+    
+    await bot.change_presence(activity=activity, status=discord_status)
+
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user}')
     print('Administrator mode: OFF')
-    check_minecraft_server.start()  # Start background task
-    print('Minecraft server monitoring started')
+    await set_bot_status()
+    print('Bot status set from template')
 
 @bot.event
 async def on_command_error(ctx, error):
@@ -324,8 +433,11 @@ async def minecraft(ctx):
     """Returns Minecraft server connection info."""
     global minecraft_server_ip, minecraft_server_online
     
+    # Load template
+    template = load_minecraft_template()
+    
     if minecraft_server_ip is None:
-        await ctx.send("🔄 Fetching server information...")
+        await ctx.send(template['LOADING_MESSAGE'])
         # Try to get IP
         try:
             result = subprocess.run(
@@ -337,86 +449,88 @@ async def minecraft(ctx):
             if result.returncode == 0:
                 minecraft_server_ip = result.stdout.strip()
             else:
-                return await ctx.send("❌ Could not fetch public IP address.")
+                return await ctx.send(template['ERROR_NO_IP'])
         except Exception as e:
-            return await ctx.send(f"❌ Error fetching IP: {e}")
-    
-    server_address = f"{minecraft_server_ip}:25565"
-    map_url = f"http://{minecraft_server_ip}:8080"
-    status_emoji = "🟢" if minecraft_server_online else "🔴"
-    status_text = "Online" if minecraft_server_online else "Offline"
-    
-    embed = discord.Embed(
-        title="🎮 Minecraft Server",
-        description=f"{status_emoji} Status: **{status_text}**",
-        color=discord.Color.green() if minecraft_server_online else discord.Color.red()
-    )
-    embed.add_field(name="Server Address", value=f"`{server_address}`", inline=False)
-    embed.add_field(name="Map URL", value=f"[View Map]({map_url})", inline=False)
-    embed.add_field(name="Connect", value=f"Use this address in Minecraft to join!", inline=False)
-    
-    await ctx.send(embed=embed)
-
-# Background task to check Minecraft server status
-@tasks.loop(seconds=60)
-async def check_minecraft_server():
-    """Checks if Minecraft server is online and updates bot status."""
-    global minecraft_server_online, minecraft_server_ip
-    
-    # Get public IP if not already cached
-    if minecraft_server_ip is None:
-        try:
-            result = subprocess.run(
-                ['curl', 'ipv4.icanhazip.com'],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            if result.returncode == 0:
-                minecraft_server_ip = result.stdout.strip()
-                print(f"📡 Detected public IP: {minecraft_server_ip}")
-        except Exception as e:
-            print(f"❌ Error fetching public IP: {e}")
-            minecraft_server_ip = "localhost"  # Fallback
+            error_msg = template['ERROR_EXCEPTION'].replace('{error}', str(e))
+            return await ctx.send(error_msg)
     
     # Check if server is online by attempting socket connection
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(3)
         # Try to connect to localhost on port 25565
-        result = sock.connect_ex(('localhost', 25565))
+        result = sock.connect_ex((minecraft_server_ip, 25565))
         sock.close()
-        
-        was_online = minecraft_server_online
         minecraft_server_online = (result == 0)
-        
-        # Update bot status
-        if minecraft_server_online:
-            await bot.change_presence(
-                activity=discord.Game(name="Minecraft: Online 🟢"),
-                status=discord.Status.online
-            )
-            if not was_online:
-                print("✅ Minecraft server is now ONLINE")
-        else:
-            await bot.change_presence(
-                activity=discord.Game(name="Minecraft: Offline 🔴"),
-                status=discord.Status.idle
-            )
-            if was_online:
-                print("⚠️ Minecraft server is now OFFLINE")
-    
     except Exception as e:
         print(f"❌ Error checking Minecraft server: {e}")
         minecraft_server_online = False
-        await bot.change_presence(
-            activity=discord.Game(name="Minecraft: Unknown ⚪"),
-            status=discord.Status.idle
-        )
-
-@check_minecraft_server.before_loop
-async def before_check_server():
-    """Wait for bot to be ready before starting the loop."""
-    await bot.wait_until_ready()
+    
+    # Prepare variables
+    server_address = f"{minecraft_server_ip}:25565"
+    map_url = f"http://{minecraft_server_ip}:8080"
+    status_emoji = "🟢" if minecraft_server_online else "🔴"
+    status_text = "Online" if minecraft_server_online else "Offline"
+    
+    # Calculate last updated time
+    last_updated_date = template.get('LAST_UPDATED_DATE', '')
+    last_updated_text = calculate_relative_time(last_updated_date) if last_updated_date else 'Unknown'
+    
+    # Replace variables in template
+    variables = {
+        '{serverAddress}': server_address,
+        '{mapUrl}': map_url,
+        '{statusEmoji}': status_emoji,
+        '{statusText}': status_text,
+        '{lastUpdated}': last_updated_text,
+        '{versionName}': template.get('VERSION_NAME', 'N/A'),
+        '{versionDescription}': template.get('VERSION_DESCRIPTION', ''),
+        '{driveLink}': template.get('DRIVE_LINK', 'https://drive.google.com'),
+        '{instructions}': template.get('INSTRUCTIONS', 'No instructions provided'),
+    }
+    
+    def replace_vars(text):
+        for var, value in variables.items():
+            text = text.replace(var, value)
+        return text
+    
+    # Build embed from template
+    embed = discord.Embed(
+        title=replace_vars(template['EMBED_TITLE']),
+        description=replace_vars(template['EMBED_DESCRIPTION']),
+        color=discord.Color.green() if minecraft_server_online else discord.Color.red()
+    )
+    embed.add_field(
+        name=replace_vars(template['FIELD_1_NAME']),
+        value=replace_vars(template['FIELD_1_VALUE']),
+        inline=False
+    )
+    embed.add_field(
+        name=replace_vars(template['FIELD_2_NAME']),
+        value=replace_vars(template['FIELD_2_VALUE']),
+        inline=False
+    )
+    embed.add_field(
+        name=replace_vars(template['FIELD_3_NAME']),
+        value=replace_vars(template['FIELD_3_VALUE']),
+        inline=False
+    )
+    embed.add_field(
+        name=replace_vars(template['FIELD_4_NAME']),
+        value=replace_vars(template['FIELD_4_VALUE']),
+        inline=False
+    )
+    embed.add_field(
+        name=replace_vars(template['FIELD_5_NAME']),
+        value=replace_vars(template['FIELD_5_VALUE']),
+        inline=False
+    )
+    embed.add_field(
+        name=replace_vars(template['FIELD_6_NAME']),
+        value=replace_vars(template['FIELD_6_VALUE']),
+        inline=False
+    )
+    
+    await ctx.send(embed=embed)
 
 bot.run(TOKEN)

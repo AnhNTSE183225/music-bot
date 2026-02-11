@@ -1,0 +1,83 @@
+[LOADING_MESSAGE]
+🔄 Fetching server information...
+
+[ERROR_NO_IP]
+❌ Could not fetch public IP address.
+
+[ERROR_EXCEPTION]
+❌ Error fetching IP: {error}
+
+[EMBED_TITLE]
+🎮 Minecraft Server
+
+[EMBED_DESCRIPTION]
+{statusEmoji} Status: **{statusText}**
+
+[FIELD_1_NAME]
+Server Address
+
+[FIELD_1_VALUE]
+`{serverAddress}`
+
+[FIELD_2_NAME]
+Map URL
+
+[FIELD_2_VALUE]
+[View Map]({mapUrl})
+
+[FIELD_3_NAME]
+📅 CLIENT LAST UPDATED
+
+[FIELD_3_VALUE]
+**🕒 {lastUpdated}**
+
+[FIELD_4_NAME]
+Latest Client Version
+
+[FIELD_4_VALUE]
+**{versionName}**
+{versionDescription}
+
+[FIELD_5_NAME]
+Download Client
+
+[FIELD_5_VALUE]
+[Google Drive Link]({driveLink})
+
+[FIELD_6_NAME]
+Instructions
+
+[FIELD_6_VALUE]
+{instructions}
+
+[LAST_UPDATED_DATE]
+2026-02-12-03-00
+
+[VERSION_NAME]
+1.0.4
+
+[VERSION_DESCRIPTION]
+- Added core libraries
+- Added Roughly Enough Items: Learn crafting recipes using R and usages using U
+- Added TooManyEntities to reduce lags on Liam farm
+- Added MAC Support: Script is newly created, please give feedback and tell me if it works.
+
+[DRIVE_LINK]
+https://drive.google.com/file/d/1pQ5I5ZQPnGDNjKleOpyumklP95kHkXsU/view?usp=sharing
+
+[INSTRUCTIONS]
+1. Download
+2. Install JDK (if haven't)
+3. Install TLauncher (if haven't)
+4. Install Fabric (if haven't)
+5. Re-open Fabric, install
+6. Click sync-mods.bat for Windows, sync-mods-mac.sh for Mac users
+
+[BOT_STATUS_TYPE]
+playing
+
+[BOT_STATUS_TEXT]
+Type !minecraft for server info
+
+[BOT_STATUS_STATE]
+online
