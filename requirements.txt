@@ -1,0 +1,8 @@
+# Discord.py with voice support (fixed version from master branch)
+discord.py[voice] @ git+https://github.com/rapptz/discord.py
+
+# YouTube download support
+yt-dlp
+
+# Environment variables
+python-dotenv

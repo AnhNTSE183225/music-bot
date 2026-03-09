@@ -25,8 +25,7 @@ load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
 
 # --- SETUP ---
-intents = discord.Intents.default()
-intents.message_content = True
+intents = discord.Intents.all()
 
 bot = commands.Bot(command_prefix=settings.COMMAND_PREFIX, intents=intents)
 
@@ -161,6 +160,11 @@ async def play_next(ctx):
     """Plays the next item in the queue with volume control."""
     global current_volume
     
+    # Check if voice client exists and is connected
+    if not ctx.voice_client or not ctx.voice_client.is_connected():
+        print("🔴 DEBUG: Voice client not connected, cannot play next song")
+        return
+    
     if song_queue:
         song = song_queue.pop(0)
         
@@ -198,19 +202,26 @@ async def play_next(ctx):
             source = discord.PCMVolumeTransformer(source)
             source.volume = current_volume
 
-            # 3. Play
-            ctx.voice_client.play(
-                source, 
-                after=lambda e: bot.loop.create_task(play_next(ctx))
-            )
-            
-            await ctx.send(f"🎶 **Now Playing:** {song['title']} (Vol: {int(current_volume * 100)}%)")
+            # 3. Play - double check connection before playing
+            if ctx.voice_client and ctx.voice_client.is_connected():
+                ctx.voice_client.play(
+                    source, 
+                    after=lambda e: bot.loop.create_task(play_next(ctx))
+                )
+                await ctx.send(f"🎶 **Now Playing:** {song['title']} (Vol: {int(current_volume * 100)}%)")
+            else:
+                print("🔴 DEBUG: Lost connection before playing")
+                song_queue.insert(0, song)  # Put song back in queue
+                await ctx.send("❌ Lost voice connection")
         
         except Exception as e:
             print(f"🔴 DEBUG ERROR in play_next:")
             print(traceback.format_exc())
-            await ctx.send(f"❌ Error playing next song: {e}")
-            await play_next(ctx) # Try the next one
+            await ctx.send(f"❌ Error playing: {e}")
+            # Try next song after a small delay
+            await asyncio.sleep(1)
+            if ctx.voice_client and ctx.voice_client.is_connected():
+                await play_next(ctx)
     else:
         pass
 
@@ -270,17 +281,32 @@ async def on_command_error(ctx, error):
 async def join(ctx):
     if ctx.author.voice:
         channel = ctx.author.voice.channel
-        await channel.connect()
-        await ctx.send(f"👋 Joined **{channel}**")
+        if ctx.voice_client:
+            await ctx.voice_client.move_to(channel)
+            await ctx.send(f"🔄 Moved to **{channel}**")
+        else:
+            await channel.connect(timeout=10.0, reconnect=True)
+            await asyncio.sleep(1)  # Give connection time to stabilize
+            await ctx.send(f"👋 Joined **{channel}**")
     else:
         await ctx.send("You need to be in a voice channel first.")
 
 @bot.command()
 async def play(ctx, *, query):
     """Plays LOCAL file."""
-    if not ctx.voice_client:
-        if ctx.author.voice: await ctx.author.voice.channel.connect()
-        else: return await ctx.send("Join a voice channel first.")
+    if not ctx.voice_client or not ctx.voice_client.is_connected():
+        if ctx.author.voice: 
+            try:
+                await ctx.author.voice.channel.connect(timeout=10.0, reconnect=True)
+                await asyncio.sleep(1)  # Give connection time to stabilize
+            except Exception as e:
+                return await ctx.send(f"❌ Failed to connect: {e}")
+        else: 
+            return await ctx.send("Join a voice channel first.")
+
+    # Verify connection
+    if not ctx.voice_client or not ctx.voice_client.is_connected():
+        return await ctx.send("❌ Failed to connect to voice channel.")
 
     filename = find_best_match(query)
     if not filename:
@@ -297,9 +323,19 @@ async def play(ctx, *, query):
 @bot.command()
 async def yt(ctx, *, query):
     """Plays from YouTube (Url or Search)."""
-    if not ctx.voice_client:
-        if ctx.author.voice: await ctx.author.voice.channel.connect()
-        else: return await ctx.send("Join a voice channel first.")
+    if not ctx.voice_client or not ctx.voice_client.is_connected():
+        if ctx.author.voice: 
+            try:
+                await ctx.author.voice.channel.connect(timeout=10.0, reconnect=True)
+                await asyncio.sleep(1)  # Give connection time to stabilize
+            except Exception as e:
+                return await ctx.send(f"❌ Failed to connect: {e}")
+        else: 
+            return await ctx.send("Join a voice channel first.")
+
+    # Verify connection
+    if not ctx.voice_client or not ctx.voice_client.is_connected():
+        return await ctx.send("❌ Failed to connect to voice channel.")
 
     # 1. Determine if the user provided a LINK or a SEARCH PHRASE
     # We check if it starts with http or www
@@ -332,6 +368,10 @@ async def yt(ctx, *, query):
         song_obj = {'type': 'youtube', 'title': title, 'data': webpage_url}
         song_queue.append(song_obj)
         print(f"🔴 DEBUG: Added song to queue - Title: {title}")
+
+        # Double-check voice connection before playing
+        if not ctx.voice_client:
+            return await ctx.send("❌ Lost voice connection.")
 
         if not ctx.voice_client.is_playing():
             await play_next(ctx)

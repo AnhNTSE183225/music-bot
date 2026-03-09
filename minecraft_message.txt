@@ -54,7 +54,7 @@ Instructions
 2026-02-12-03-00
 
 [VERSION_NAME]
-1.0.4
+1.0.4 (Please update after yesterday's crashing incident)
 
 [VERSION_DESCRIPTION]
 - Added core libraries
