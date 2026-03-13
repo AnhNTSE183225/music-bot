@@ -139,15 +139,28 @@ def load_minecraft_template():
     return template
 
 def load_special_message():
-    """Load the special broadcast message from special.txt each time."""
+    """Load channel id (line 1) and message body (remaining lines) from special.txt."""
     try:
         with open(SPECIAL_MESSAGE_FILE, 'r', encoding='utf-8') as f:
-            return f.read().strip()
+            lines = f.read().splitlines()
     except FileNotFoundError:
-        return ""
+        return None, None, "special.txt is missing."
     except Exception as e:
         print(f"Error reading {SPECIAL_MESSAGE_FILE}: {e}")
-        return ""
+        return None, None, "Failed to read special.txt."
+
+    if not lines:
+        return None, None, "special.txt is empty."
+
+    channel_line = lines[0].strip()
+    if not channel_line.isdigit():
+        return None, None, "First line must be a numeric channel ID."
+
+    message_body = "\n".join(lines[1:]).strip()
+    if not message_body:
+        return None, None, "Message body is empty. Put message from line 2 onward."
+
+    return int(channel_line), message_body, None
 
 def find_best_match(query):
     """Smart search for local files."""
@@ -483,34 +496,35 @@ async def stop(ctx):
         await ctx.send("🛑 Stopped.")
 
 @bot.command()
-@commands.has_permissions(mention_everyone=True)
 async def special(ctx):
-    """Sends the message from special.txt and pings based on its content."""
-    if not ctx.guild:
-        return await ctx.send("❌ This command can only be used in a server.")
+    """DM-only: send special.txt content using line 1 as target channel id."""
+    if ctx.guild is not None:
+        return await ctx.send(f"❌ Use this in DM only: `{settings.COMMAND_PREFIX}special`")
 
-    me = ctx.guild.me
-    if not me or not me.guild_permissions.mention_everyone:
-        return await ctx.send("❌ I need the 'Mention @everyone, @here, and All Roles' permission.")
+    channel_id, special_message, error_text = load_special_message()
+    if error_text:
+        return await ctx.send(f"❌ {error_text}")
 
-    if not me.guild_permissions.manage_messages:
-        return await ctx.send("❌ I need 'Manage Messages' permission for anonymous mode.")
+    target_channel = bot.get_channel(channel_id)
+    if target_channel is None:
+        try:
+            target_channel = await bot.fetch_channel(channel_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return await ctx.send("❌ Invalid channel ID or I cannot access that channel.")
+
+    if not hasattr(target_channel, 'send'):
+        return await ctx.send("❌ Target is not a message channel.")
 
     try:
-        await ctx.message.delete()
-    except discord.Forbidden:
-        return await ctx.send("❌ I could not delete your command message.")
-    except discord.HTTPException:
-        return
-
-    special_message = load_special_message()
-    if not special_message:
-        return await ctx.send("❌ special.txt is empty or missing.")
-
-    await ctx.send(
-        special_message,
+        await target_channel.send(
+            special_message,
             allowed_mentions=discord.AllowedMentions(everyone=True, roles=True, users=True)
-    )
+        )
+        await ctx.send(f"✅ Sent to channel: `{channel_id}`")
+    except discord.Forbidden:
+        await ctx.send("❌ I don't have permission to send there.")
+    except discord.HTTPException as e:
+        await ctx.send(f"❌ Failed to send message: {e}")
 
 @bot.command()
 async def minecraft(ctx):
