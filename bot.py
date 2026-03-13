@@ -61,6 +61,7 @@ song_queue = []
 current_volume = 0.5  # Default volume (0.5 = 50%)
 minecraft_server_online = False
 minecraft_server_ip = None
+SPECIAL_MESSAGE_FILE = 'special.txt'
 
 def calculate_relative_time(date_string):
     """Calculate relative time from YYYY-MM-DD-HH-MM format (GMT+7)."""
@@ -136,6 +137,17 @@ def load_minecraft_template():
             'BOT_STATUS_STATE': 'online',
         }
     return template
+
+def load_special_message():
+    """Load the special broadcast message from special.txt each time."""
+    try:
+        with open(SPECIAL_MESSAGE_FILE, 'r', encoding='utf-8') as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+    except Exception as e:
+        print(f"Error reading {SPECIAL_MESSAGE_FILE}: {e}")
+        return ""
 
 def find_best_match(query):
     """Smart search for local files."""
@@ -272,6 +284,8 @@ async def on_command_error(ctx, error):
     """Handles permission errors nicely."""
     if isinstance(error, commands.CommandNotFound):
         pass # Ignore invalid commands
+    elif isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ You don't have permission to use this command.")
     else:
         await ctx.send(f"❌ An error occurred: {error}")
 
@@ -467,6 +481,36 @@ async def stop(ctx):
         ctx.voice_client.stop()
         await ctx.voice_client.disconnect()
         await ctx.send("🛑 Stopped.")
+
+@bot.command()
+@commands.has_permissions(mention_everyone=True)
+async def special(ctx):
+    """Sends the message from special.txt and pings based on its content."""
+    if not ctx.guild:
+        return await ctx.send("❌ This command can only be used in a server.")
+
+    me = ctx.guild.me
+    if not me or not me.guild_permissions.mention_everyone:
+        return await ctx.send("❌ I need the 'Mention @everyone, @here, and All Roles' permission.")
+
+    if not me.guild_permissions.manage_messages:
+        return await ctx.send("❌ I need 'Manage Messages' permission for anonymous mode.")
+
+    try:
+        await ctx.message.delete()
+    except discord.Forbidden:
+        return await ctx.send("❌ I could not delete your command message.")
+    except discord.HTTPException:
+        return
+
+    special_message = load_special_message()
+    if not special_message:
+        return await ctx.send("❌ special.txt is empty or missing.")
+
+    await ctx.send(
+        special_message,
+            allowed_mentions=discord.AllowedMentions(everyone=True, roles=True, users=True)
+    )
 
 @bot.command()
 async def minecraft(ctx):
