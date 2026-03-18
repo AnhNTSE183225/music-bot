@@ -59,6 +59,7 @@ ytdl = yt_dlp.YoutubeDL(YTDL_FORMAT_OPTIONS)
 # GLOBAL VARIABLES
 song_queue = []
 current_volume = 0.5  # Default volume (0.5 = 50%)
+play_next_lock = asyncio.Lock()
 minecraft_server_online = False
 minecraft_server_ip = None
 SPECIAL_MESSAGE_FILE = 'special.txt'
@@ -184,15 +185,22 @@ def find_best_match(query):
 async def play_next(ctx):
     """Plays the next item in the queue with volume control."""
     global current_volume
-    
-    # Check if voice client exists and is connected
-    if not ctx.voice_client or not ctx.voice_client.is_connected():
-        print("🔴 DEBUG: Voice client not connected, cannot play next song")
-        return
-    
-    if song_queue:
+
+    async with play_next_lock:
+        # Check if voice client exists and is connected
+        if not ctx.voice_client or not ctx.voice_client.is_connected():
+            print("🔴 DEBUG: Voice client not connected, cannot play next song")
+            return
+
+        # Guard against concurrent starters.
+        if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
+            return
+
+        if not song_queue:
+            return
+
         song = song_queue.pop(0)
-        
+
         try:
             print(f"🔴 DEBUG: Now playing - {song['type']}: {song['title']}")
             # 1. Create the base Source
@@ -201,18 +209,18 @@ async def play_next(ctx):
                 source = discord.FFmpegPCMAudio(source_path)
             elif song['type'] == 'youtube':
                 print(f"🔴 DEBUG: Creating FFmpeg source for YouTube")
-                
+
                 # Use discord.py's recommended approach with loop
                 loop = asyncio.get_event_loop()
                 data = await loop.run_in_executor(None, lambda: ytdl.extract_info(song['data'], download=False))
-                
+
                 if 'entries' in data:
                     data = data['entries'][0]
-                
+
                 filename = data['url']
                 print(f"🔴 DEBUG: Stream URL obtained: {filename[:100]}")
                 print(f"🔴 DEBUG: Format: {data.get('format_id')}, ext: {data.get('ext')}")
-                
+
                 source = discord.FFmpegPCMAudio(filename, **FFMPEG_OPTIONS)
             elif song['type'] == 'url':
                 print(f"🔴 DEBUG: Creating FFmpeg source for generic URL")
@@ -221,24 +229,33 @@ async def play_next(ctx):
                     before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
                     options="-vn"
                 )
+            else:
+                raise ValueError(f"Unknown song type: {song['type']}")
 
             # 2. Apply Volume Transformer
             # This wrapper allows us to change volume
             source = discord.PCMVolumeTransformer(source)
             source.volume = current_volume
 
-            # 3. Play - double check connection before playing
+            # 3. Play - double check connection and playback state before playing
             if ctx.voice_client and ctx.voice_client.is_connected():
-                ctx.voice_client.play(
-                    source, 
-                    after=lambda e: bot.loop.create_task(play_next(ctx))
-                )
+                if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
+                    # Another call started playback while we were preparing this source.
+                    song_queue.insert(0, song)
+                    return
+
+                def after_playback(error):
+                    if error:
+                        print(f"🔴 DEBUG: Playback callback error: {error}")
+                    bot.loop.call_soon_threadsafe(lambda: bot.loop.create_task(play_next(ctx)))
+
+                ctx.voice_client.play(source, after=after_playback)
                 await ctx.send(f"🎶 **Now Playing:** {song['title']} (Vol: {int(current_volume * 100)}%)")
             else:
                 print("🔴 DEBUG: Lost connection before playing")
                 song_queue.insert(0, song)  # Put song back in queue
                 await ctx.send("❌ Lost voice connection")
-        
+
         except Exception as e:
             print(f"🔴 DEBUG ERROR in play_next:")
             print(traceback.format_exc())
@@ -246,9 +263,7 @@ async def play_next(ctx):
             # Try next song after a small delay
             await asyncio.sleep(1)
             if ctx.voice_client and ctx.voice_client.is_connected():
-                await play_next(ctx)
-    else:
-        pass
+                bot.loop.create_task(play_next(ctx))
 
 # --- EVENTS ---
 
