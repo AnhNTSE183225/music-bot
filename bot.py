@@ -4,6 +4,7 @@ import os
 import asyncio
 import yt_dlp
 import difflib
+import re
 from dotenv import load_dotenv
 import settings
 import traceback
@@ -63,6 +64,37 @@ play_next_lock = asyncio.Lock()
 minecraft_server_online = False
 minecraft_server_ip = None
 SPECIAL_MESSAGE_FILE = 'special.txt'
+
+def load_yt_blacklist_patterns():
+    """Load regex blacklist patterns from text file (one pattern per line)."""
+    patterns = []
+    blacklist_file = getattr(settings, 'YT_BLACKLIST_FILE', 'yt_blacklist.txt')
+
+    try:
+        with open(blacklist_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                raw = line.strip()
+                if not raw or raw.startswith('#'):
+                    continue
+                try:
+                    patterns.append(re.compile(raw, re.IGNORECASE))
+                except re.error as e:
+                    print(f"⚠️ Invalid regex in {blacklist_file}: {raw} ({e})")
+    except FileNotFoundError:
+        # Missing file means no blacklist rules are loaded.
+        return []
+    except Exception as e:
+        print(f"⚠️ Failed to read {blacklist_file}: {e}")
+        return []
+
+    return patterns
+
+def is_blacklisted_title(title):
+    """Return True if the title matches any blacklist regex pattern."""
+    for pattern in load_yt_blacklist_patterns():
+        if pattern.search(title):
+            return True
+    return False
 
 def calculate_relative_time(date_string):
     """Calculate relative time from YYYY-MM-DD-HH-MM format (GMT+7)."""
@@ -398,6 +430,10 @@ async def yt(ctx, *, query):
             video_data = data
         
         title = video_data['title']
+
+        if is_blacklisted_title(title):
+            return await ctx.send("This song is in blacklist")
+
         # Use webpage_url - this will be processed by yt-dlp again during playback
         webpage_url = video_data.get('webpage_url') or video_data.get('url')
         

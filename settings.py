@@ -3,6 +3,7 @@ import os
 # General Config
 MEDIA_FOLDER = 'media'
 COMMAND_PREFIX = '!'
+YT_BLACKLIST_FILE = 'yt_blacklist.txt'
 
 # YouTube / YTDL Options
 # Points to cookies.txt to avoid login issues
