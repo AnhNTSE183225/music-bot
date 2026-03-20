@@ -59,6 +59,21 @@ permissions:
     # open: anyone can run
     # admin_only: only users with Discord Administrator permission can run
     # vote_if_non_admin: admins run directly, non-admins must pass vote
+    help:
+      mode: "open"
+
+    join:
+      mode: "open"
+
+    play:
+      mode: "open"
+
+    yt:
+      mode: "open"
+
+    queue:
+      mode: "open"
+
     skip:
       mode: "vote_if_non_admin"
       vote:
@@ -67,6 +82,9 @@ permissions:
         min_votes: 1                  # floor for required votes
         same_channel_only: true
         force_vote_for_admin: false   # debug: when true, admins must vote like non-admins
+
+    remove:
+      mode: "vote_if_non_admin"
 
     skipto:
       mode: "admin_only"
@@ -78,4 +96,7 @@ permissions:
       mode: "admin_only"
 
     volume:
+      mode: "admin_only"
+
+    reload_blacklist:
       mode: "admin_only"

@@ -221,6 +221,29 @@ def register_vote(guild_id, action_key, user_id):
     votes.add(user_id)
     return votes, already_voted
 
+
+def validate_command_permissions_config():
+    """Ensure every registered command has an explicit permissions config entry."""
+    permissions_cfg = settings.get_permissions_config()
+    commands_cfg = permissions_cfg.get('commands', {}) or {}
+
+    configured_commands = set(commands_cfg.keys())
+    registered_commands = {cmd.name for cmd in bot.commands}
+
+    missing = sorted(registered_commands - configured_commands)
+    if missing:
+        raise RuntimeError(
+            "Missing permissions.commands entries in config.yaml for: "
+            + ", ".join(missing)
+        )
+
+    extra = sorted(configured_commands - registered_commands)
+    if extra:
+        logger.warning(
+            "permissions.commands has extra entries not registered in bot: %s",
+            ", ".join(extra)
+        )
+
 async def play_next(ctx):
     """Plays the next item in the queue with volume control. Must be called within play_next_lock."""
     global current_volume
@@ -659,6 +682,7 @@ async def setup_hook():
     """Called after the bot is logged in but before on_ready."""
     global _blacklist_patterns
     try:
+        validate_command_permissions_config()
         _blacklist_patterns = load_yt_blacklist_patterns()
         logger.info(f"Blacklist initialized with {len(_blacklist_patterns)} patterns.")
     except Exception as e:
