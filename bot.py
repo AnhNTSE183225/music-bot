@@ -1,5 +1,5 @@
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 import os
 import asyncio
 import yt_dlp
@@ -7,9 +7,9 @@ import difflib
 import re
 from dotenv import load_dotenv
 import settings
-import traceback
 import logging
 import importlib
+import math
 from datetime import datetime, timedelta, timezone
 
 # Configure logging
@@ -28,7 +28,7 @@ logger.addHandler(file_handler)
 
 # Load Secrets
 load_dotenv()
-TOKEN = os.getenv('DISCORD_TOKEN')
+TOKEN = os.getenv(settings.TOKEN_ENV_VAR)
 
 # Validate token on startup
 if not TOKEN:
@@ -42,33 +42,14 @@ intents = discord.Intents.all()
 
 bot = commands.Bot(command_prefix=settings.COMMAND_PREFIX, intents=intents)
 
-# YouTube / YTDL Options
-YTDL_FORMAT_OPTIONS = {
-    'format': 'bestaudio/best',
-    'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
-    'restrictfilenames': True,
-    'noplaylist': True,
-    'nocheckcertificate': True,
-    'ignoreerrors': False,
-    'logtostderr': False,
-    'quiet': True,
-    'no_warnings': True,
-    'default_search': 'auto',
-    'source_address': '0.0.0.0',
-    'extractor_args': {'youtube': {'player_client': ['android']}},
-}
-
-FFMPEG_OPTIONS = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    'options': '-vn',
-}
-
-ytdl = yt_dlp.YoutubeDL(YTDL_FORMAT_OPTIONS)
+ytdl = yt_dlp.YoutubeDL(settings.YTDL_OPTIONS)
 
 # GLOBAL VARIABLES
 song_queue = []
 current_volume = settings.DEFAULT_VOLUME
 play_next_lock = asyncio.Lock()
+votes_by_guild = {}
+next_queue_id = 1
 
 # Cache blacklist patterns at module level (load once on startup)
 _blacklist_patterns = []
@@ -137,6 +118,109 @@ async def ensure_voice_connected(ctx):
         await ctx.send(f"❌ Failed to connect: {e}")
         return False
 
+
+def make_song(song_type, title, data, requester):
+    """Create a queue song object with requester metadata."""
+    global next_queue_id
+    song = {
+        'queue_id': next_queue_id,
+        'type': song_type,
+        'title': title,
+        'data': data,
+        'requester_id': requester.id,
+        'requester_mention': requester.mention,
+        'requester_handle': str(requester),
+    }
+    next_queue_id += 1
+    return song
+
+
+def is_admin_member(member):
+    """Return True if the Discord member has Administrator permission."""
+    return bool(getattr(member.guild_permissions, 'administrator', False))
+
+
+def get_command_mode(command_name):
+    """Get normalized command permission mode from config."""
+    mode = settings.get_command_permission_mode(command_name)
+    valid_modes = {'open', 'admin_only', 'vote_if_non_admin'}
+    if mode not in valid_modes:
+        logger.warning(f"Invalid mode '{mode}' for command '{command_name}', using 'open'")
+        return 'open'
+    return mode
+
+
+async def enforce_command_access(ctx, command_name):
+    """Return True if user can execute command immediately."""
+    mode = get_command_mode(command_name)
+    if mode == 'open' or is_admin_member(ctx.author):
+        return True
+    if mode == 'admin_only':
+        await ctx.send("❌ Only administrators can use this command.")
+        return False
+    return True
+
+
+def clear_votes(guild_id, action_key=None):
+    """Clear votes for one guild, or one action if action_key is provided."""
+    if action_key is None:
+        votes_by_guild.pop(guild_id, None)
+        return
+
+    guild_votes = votes_by_guild.get(guild_id)
+    if not guild_votes:
+        return
+
+    guild_votes.pop(action_key, None)
+    if not guild_votes:
+        votes_by_guild.pop(guild_id, None)
+
+
+def get_skip_vote_eligible_members(ctx, same_channel_only):
+    """Get members eligible to participate in skip voting."""
+    if not ctx.guild:
+        return []
+
+    if same_channel_only:
+        if not ctx.voice_client or not ctx.voice_client.channel:
+            return []
+        return [m for m in ctx.voice_client.channel.members if not m.bot]
+
+    return [m for m in ctx.guild.members if (not m.bot and m.voice and m.voice.channel)]
+
+
+def get_skip_vote_required_count(ctx):
+    """Calculate required votes from config and current eligible members."""
+    vote_cfg = settings.get_skip_vote_config()
+    eligible_members = get_skip_vote_eligible_members(ctx, vote_cfg['same_channel_only'])
+    member_count = len(eligible_members)
+
+    if member_count == 0:
+        return 1, 0
+
+    threshold_type = str(vote_cfg['threshold_type']).lower()
+    threshold_value = vote_cfg['threshold_value']
+    min_votes = max(1, int(vote_cfg['min_votes']))
+
+    if threshold_type == 'absolute':
+        base_required = max(1, int(threshold_value))
+    else:
+        ratio = float(threshold_value)
+        base_required = math.ceil(member_count * ratio)
+
+    required = max(min_votes, base_required)
+    required = min(required, member_count)
+    return required, member_count
+
+
+def register_vote(guild_id, action_key, user_id):
+    """Register one vote for a guild/action and return the updated vote set."""
+    guild_votes = votes_by_guild.setdefault(guild_id, {})
+    votes = guild_votes.setdefault(action_key, set())
+    already_voted = user_id in votes
+    votes.add(user_id)
+    return votes, already_voted
+
 async def play_next(ctx):
     """Plays the next item in the queue with volume control. Must be called within play_next_lock."""
     global current_volume
@@ -175,7 +259,7 @@ async def play_next(ctx):
             logger.debug(f"Stream URL obtained: {filename[:100]}...")
             logger.debug(f"Format: {data.get('format_id')}, ext: {data.get('ext')}")
 
-            source = discord.FFmpegPCMAudio(filename, **FFMPEG_OPTIONS)
+            source = discord.FFmpegPCMAudio(filename, **settings.FFMPEG_OPTIONS)
         elif song['type'] == 'url':
             logger.debug(f"Creating FFmpeg source for generic URL: {song['data']}")
             source = discord.FFmpegPCMAudio(
@@ -208,8 +292,13 @@ async def play_next(ctx):
                             await play_next(ctx)
                 bot.loop.call_soon_threadsafe(lambda: bot.loop.create_task(next_with_lock()))
 
+            if ctx.guild:
+                clear_votes(ctx.guild.id, action_key='skip')
             ctx.voice_client.play(source, after=after_playback)
-            await ctx.send(f"🎶 **Now Playing:** {song['title']} (Vol: {int(current_volume * 100)}%)")
+            await ctx.send(
+                f"🎶 **Now Playing:** {song['title']} "
+                f"(requested by {song.get('requester_mention', 'unknown')}, Vol: {int(current_volume * 100)}%)"
+            )
         else:
             logger.warning("Lost connection before playing")
             song_queue.insert(0, song)  # Put song back in queue
@@ -229,8 +318,6 @@ async def play_next(ctx):
 @bot.event
 async def on_ready():
     logger.info(f'Logged in as {bot.user}')
-    print(f'Logged in as {bot.user}')
-    print('Administrator mode: OFF')
 
 @bot.event
 async def on_command_error(ctx, error):
@@ -276,14 +363,14 @@ async def play(ctx, *, query):
     if not filename:
         return await ctx.send(f"❌ File not found matching: {query}")
 
-    song_obj = {'type': 'local', 'title': filename, 'data': filename}
+    song_obj = make_song('local', filename, filename, ctx.author)
     song_queue.append(song_obj)
 
     async with play_next_lock:
         if not ctx.voice_client.is_playing():
             await play_next(ctx)
         else:
-            await ctx.send(f"✅ Added to queue: `{filename}`")
+            await ctx.send(f"✅ Added to queue: `{filename}` (added by {ctx.author.mention})")
 
 @bot.command()
 async def yt(ctx, *, query):
@@ -327,7 +414,7 @@ async def yt(ctx, *, query):
         
         logger.debug(f"Using webpage URL: {webpage_url}")
         
-        song_obj = {'type': 'youtube', 'title': title, 'data': webpage_url}
+        song_obj = make_song('youtube', title, webpage_url, ctx.author)
         song_queue.append(song_obj)
         logger.debug(f"Added song to queue - Title: {title}")
 
@@ -339,7 +426,7 @@ async def yt(ctx, *, query):
             if not ctx.voice_client.is_playing():
                 await play_next(ctx)
             else:
-                await ctx.send(f"✅ Added to queue: `{title}`")
+                await ctx.send(f"✅ Added to queue: `{title}` (added by {ctx.author.mention})")
 
     except Exception as e:
         logger.error(f"Error in yt command: {e}", exc_info=True)
@@ -349,6 +436,9 @@ async def yt(ctx, *, query):
 async def volume(ctx, volume: int):
     """Sets volume (0-100). Usage: !volume <0-100>"""
     global current_volume
+
+    if not await enforce_command_access(ctx, 'volume'):
+        return
     
     # Validate input
     if not (0 <= volume <= 100):
@@ -365,12 +455,51 @@ async def volume(ctx, volume: int):
 
 @bot.command()
 async def skip(ctx):
-    """Skips the current song."""
-    if ctx.voice_client and ctx.voice_client.is_playing():
+    """Skips current song based on configured permissions and vote rules."""
+    if not ctx.voice_client or not ctx.voice_client.is_playing():
+        await ctx.send("❌ Nothing is playing.")
+        return
+
+    mode = get_command_mode('skip')
+    vote_cfg = settings.get_skip_vote_config()
+    force_vote_for_admin = vote_cfg.get('force_vote_for_admin', False)
+
+    if is_admin_member(ctx.author) and not force_vote_for_admin:
+        clear_votes(ctx.guild.id, action_key='skip')
+        ctx.voice_client.stop()
+        await ctx.send("⏭️ Skipped by admin.")
+        return
+
+    if mode == 'admin_only':
+        await ctx.send("❌ Only administrators can use this command.")
+        return
+
+    if mode == 'open':
+        clear_votes(ctx.guild.id, action_key='skip')
         ctx.voice_client.stop()
         await ctx.send("⏭️ Skipped.")
-    else:
-        await ctx.send("❌ Nothing is playing.")
+        return
+
+    if vote_cfg['same_channel_only']:
+        if not ctx.author.voice or not ctx.voice_client.channel or ctx.author.voice.channel != ctx.voice_client.channel:
+            await ctx.send("❌ You must be in the same voice channel as the bot to vote skip.")
+            return
+
+    required_votes, eligible_count = get_skip_vote_required_count(ctx)
+    votes, already_voted = register_vote(ctx.guild.id, 'skip', ctx.author.id)
+    current_votes = len(votes)
+
+    if already_voted:
+        await ctx.send(f"🗳️ You already voted to skip. Votes: **{current_votes}/{required_votes}**")
+        return
+
+    if current_votes >= required_votes:
+        clear_votes(ctx.guild.id, action_key='skip')
+        ctx.voice_client.stop()
+        await ctx.send(f"⏭️ Vote passed (**{current_votes}/{required_votes}** of {eligible_count} listeners). Skipping.")
+        return
+
+    await ctx.send(f"🗳️ Skip vote added (**{current_votes}/{required_votes}** of {eligible_count} listeners).")
 
 @bot.command()
 async def queue(ctx):
@@ -383,7 +512,7 @@ async def queue(ctx):
     queue_list = "**Upcoming Songs:**\n"
     for i, song in enumerate(song_queue):
         # i+1 makes it human readable (1, 2, 3 instead of 0, 1, 2)
-        queue_list += f"`{i+1}.` {song['title']}\n"
+        queue_list += f"`{i+1}.` {song['title']} - added by {song.get('requester_handle', 'unknown')}\n"
 
     # Discord has a message limit; if queue is huge, show first N
     max_chars = settings.DISCORD_MESSAGE_CHAR_LIMIT - settings.MESSAGE_BUFFER
@@ -395,6 +524,9 @@ async def queue(ctx):
 @bot.command()
 async def skipto(ctx, index: int):
     """Skips to a specific number in the queue. Usage: !skipto <position>"""
+    if not await enforce_command_access(ctx, 'skipto'):
+        return
+
     if not ctx.voice_client or not ctx.voice_client.is_playing():
         await ctx.send("❌ Nothing is playing right now.")
         return
@@ -418,19 +550,87 @@ async def skipto(ctx, index: int):
 @bot.command()
 async def clear(ctx):
     """Clears all upcoming songs in the queue."""
+    if not await enforce_command_access(ctx, 'clear'):
+        return
+
     song_queue.clear()
+    if ctx.guild:
+        clear_votes(ctx.guild.id)
     await ctx.send("🗑️ **Queue cleared.**")
 
 @bot.command()
 async def stop(ctx):
     """Stops playback and disconnects from voice channel."""
+    if not await enforce_command_access(ctx, 'stop'):
+        return
+
     song_queue.clear()
+    if ctx.guild:
+        clear_votes(ctx.guild.id)
     if ctx.voice_client:
         ctx.voice_client.stop()
         await ctx.voice_client.disconnect()
         await ctx.send("🛑 Stopped and disconnected.")
     else:
         await ctx.send("❌ Not connected to a voice channel.")
+
+
+@bot.command()
+async def remove(ctx, index: int):
+    """Removes a song from queue by index. Owner/admin can remove directly; others require vote."""
+    if not song_queue:
+        await ctx.send("❌ The queue is empty.")
+        return
+
+    if index < 1 or index > len(song_queue):
+        await ctx.send(f"❌ Invalid position. Please choose between 1 and {len(song_queue)}.")
+        return
+
+    target = song_queue[index - 1]
+    vote_cfg = settings.get_skip_vote_config()
+    force_vote_for_admin = vote_cfg.get('force_vote_for_admin', False)
+    is_admin = is_admin_member(ctx.author)
+    is_owner = target.get('requester_id') == ctx.author.id
+
+    if (is_admin and not force_vote_for_admin) or is_owner:
+        removed_song = song_queue.pop(index - 1)
+        if ctx.guild:
+            clear_votes(ctx.guild.id, action_key=f"remove:{removed_song['queue_id']}")
+        await ctx.send(f"🗑️ Removed `#{index}`: **{removed_song['title']}**")
+        return
+
+    if vote_cfg['same_channel_only']:
+        if not ctx.voice_client or not ctx.author.voice or not ctx.voice_client.channel or ctx.author.voice.channel != ctx.voice_client.channel:
+            await ctx.send("❌ You must be in the same voice channel as the bot to vote-remove this song.")
+            return
+
+    required_votes, eligible_count = get_skip_vote_required_count(ctx)
+    action_key = f"remove:{target['queue_id']}"
+    votes, already_voted = register_vote(ctx.guild.id, action_key, ctx.author.id)
+    current_votes = len(votes)
+
+    if already_voted:
+        await ctx.send(f"🗳️ You already voted to remove `#{index}`. Votes: **{current_votes}/{required_votes}**")
+        return
+
+    if current_votes >= required_votes:
+        current_index = next((i for i, s in enumerate(song_queue) if s.get('queue_id') == target['queue_id']), None)
+        if current_index is None:
+            clear_votes(ctx.guild.id, action_key=action_key)
+            await ctx.send("ℹ️ That song is no longer in the queue.")
+            return
+
+        removed_song = song_queue.pop(current_index)
+        clear_votes(ctx.guild.id, action_key=action_key)
+        await ctx.send(
+            f"🗑️ Vote passed (**{current_votes}/{required_votes}** of {eligible_count} listeners). "
+            f"Removed **{removed_song['title']}**."
+        )
+        return
+
+    await ctx.send(
+        f"🗳️ Remove vote added for `#{index}` (**{current_votes}/{required_votes}** of {eligible_count} listeners)."
+    )
 
 
 
@@ -467,5 +667,4 @@ async def setup_hook():
 # Main bot startup
 if __name__ == '__main__':
     logger.info("Starting MusicBot...")
-    print("Starting MusicBot...")
     bot.run(TOKEN)

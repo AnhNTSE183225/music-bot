@@ -52,3 +52,30 @@ ytdl_options:
 ffmpeg:
   before_options: "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
   audio_only: "-vn"
+
+# Command Permissions (2 roles: admin and non-admin)
+permissions:
+  commands:
+    # open: anyone can run
+    # admin_only: only users with Discord Administrator permission can run
+    # vote_if_non_admin: admins run directly, non-admins must pass vote
+    skip:
+      mode: "vote_if_non_admin"
+      vote:
+        threshold_type: "ratio"      # ratio or absolute
+        threshold_value: 0.5          # 50% when threshold_type is ratio
+        min_votes: 1                  # floor for required votes
+        same_channel_only: true
+        force_vote_for_admin: false   # debug: when true, admins must vote like non-admins
+
+    skipto:
+      mode: "admin_only"
+
+    clear:
+      mode: "admin_only"
+
+    stop:
+      mode: "admin_only"
+
+    volume:
+      mode: "admin_only"
