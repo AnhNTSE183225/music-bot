@@ -6,3 +6,6 @@ yt-dlp
 
 # Environment variables
 python-dotenv
+
+# YAML configuration parsing
+PyYAML

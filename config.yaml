@@ -1,0 +1,54 @@
+# MusicBot Configuration
+# This single configuration file replaces yt_blacklist.txt, special.txt, etc.
+
+# Discord Bot Settings
+discord:
+  command_prefix: "!"
+  token_env_var: "DISCORD_TOKEN"
+
+# Voice & Playback Settings
+playback:
+  default_volume: 0.5  # 0.0 - 1.0 (50%)
+  connection_timeout: 10.0
+  connection_stabilize_delay: 0.5
+
+# YouTube / YTDL Settings
+youtube:
+  # Regex patterns to blacklist (one per line, supports comments with #)
+  blacklist_patterns:
+    # Block songs with explicit content
+    - "(?i)(explicit|clean version)"
+    # Block copyright-striked videos
+    - "(?i)(copyright|dmca|removed)"
+    # Block ads or trailers
+    - "(?i)(trailer|advertisement|promo)"
+
+# Discord Message Settings
+message:
+  # Maximum characters for queue embed before truncating
+  embed_char_limit: 2000  # Discord's limit
+  embed_buffer: 100  # Safety margin to stay under Discord's limit
+
+# File Storage Settings
+storage:
+  media_folder: "media"
+  log_file: "musicbot.log"
+  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+
+# YouTube Downloader Options
+ytdl_options:
+  format: "bestaudio/best"
+  noplaylist: true
+  quiet: true
+  no_warnings: true
+  default_search: "auto"
+  source_address: "0.0.0.0"
+  geo_bypass: true
+  extractor_args:
+    youtube:
+      - "player_client=android"
+
+# FFmpeg Stream Options
+ffmpeg:
+  before_options: "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+  audio_only: "-vn"

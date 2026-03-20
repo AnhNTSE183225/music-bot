@@ -9,21 +9,33 @@ from dotenv import load_dotenv
 import settings
 import traceback
 import logging
-import socket
-import subprocess
+import importlib
 from datetime import datetime, timedelta, timezone
 
-# Enable debug logging
-logging.basicConfig(level=logging.DEBUG)
+# Configure logging
+logging.basicConfig(
+    level=getattr(logging, settings.LOG_LEVEL, logging.INFO),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Also log to file
-file_handler = logging.FileHandler('debug.log')
-file_handler.setLevel(logging.DEBUG)
-logging.getLogger().addHandler(file_handler)
+file_handler = logging.FileHandler(settings.LOG_FILE)
+file_handler.setLevel(getattr(logging, settings.LOG_LEVEL, logging.INFO))
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
 
 # Load Secrets
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
+
+# Validate token on startup
+if not TOKEN:
+    raise RuntimeError(
+        "DISCORD_TOKEN environment variable not set. "
+        "Please add it to your .env file or system environment."
+    )
 
 # --- SETUP ---
 intents = discord.Intents.all()
@@ -47,10 +59,6 @@ YTDL_FORMAT_OPTIONS = {
 }
 
 FFMPEG_OPTIONS = {
-    'options': '-vn',
-}
-
-FFMPEG_OPTIONS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
     'options': '-vn',
 }
@@ -59,141 +67,38 @@ ytdl = yt_dlp.YoutubeDL(YTDL_FORMAT_OPTIONS)
 
 # GLOBAL VARIABLES
 song_queue = []
-current_volume = 0.5  # Default volume (0.5 = 50%)
+current_volume = settings.DEFAULT_VOLUME
 play_next_lock = asyncio.Lock()
-minecraft_server_online = False
-minecraft_server_ip = None
-SPECIAL_MESSAGE_FILE = 'special.txt'
+
+# Cache blacklist patterns at module level (load once on startup)
+_blacklist_patterns = []
 
 def load_yt_blacklist_patterns():
-    """Load regex blacklist patterns from text file (one pattern per line)."""
+    """Load regex blacklist patterns from config.yaml."""
     patterns = []
-    blacklist_file = getattr(settings, 'YT_BLACKLIST_FILE', 'yt_blacklist.txt')
-
-    try:
-        with open(blacklist_file, 'r', encoding='utf-8') as f:
-            for line in f:
-                raw = line.strip()
-                if not raw or raw.startswith('#'):
-                    continue
-                try:
-                    patterns.append(re.compile(raw, re.IGNORECASE))
-                except re.error as e:
-                    print(f"⚠️ Invalid regex in {blacklist_file}: {raw} ({e})")
-    except FileNotFoundError:
-        # Missing file means no blacklist rules are loaded.
-        return []
-    except Exception as e:
-        print(f"⚠️ Failed to read {blacklist_file}: {e}")
-        return []
-
+    pattern_strings = settings.YT_BLACKLIST_PATTERNS
+    
+    if not pattern_strings:
+        logger.info("No YouTube blacklist patterns configured.")
+        return patterns
+    
+    for raw_pattern in pattern_strings:
+        if not raw_pattern or raw_pattern.strip().startswith('#'):
+            continue
+        try:
+            patterns.append(re.compile(raw_pattern.strip(), re.IGNORECASE))
+            logger.debug(f"Loaded blacklist pattern: {raw_pattern[:50]}")
+        except re.error as e:
+            logger.warning(f"Invalid regex pattern in config: {raw_pattern} ({e})")
+    
     return patterns
 
 def is_blacklisted_title(title):
-    """Return True if the title matches any blacklist regex pattern."""
-    for pattern in load_yt_blacklist_patterns():
+    """Return True if the title matches any blacklist regex pattern (uses cached patterns)."""
+    for pattern in _blacklist_patterns:
         if pattern.search(title):
             return True
     return False
-
-def calculate_relative_time(date_string):
-    """Calculate relative time from YYYY-MM-DD-HH-MM format (GMT+7)."""
-    try:
-        # Parse the date string
-        date_obj = datetime.strptime(date_string, '%Y-%m-%d-%H-%M')
-        
-        # Get current time in GMT+7 (using timezone-aware datetime)
-        gmt7 = timezone(timedelta(hours=7))
-        current_time = datetime.now(timezone.utc).astimezone(gmt7).replace(tzinfo=None)
-        
-        # Calculate difference
-        diff = current_time - date_obj
-        
-        # Convert to appropriate unit
-        total_seconds = diff.total_seconds()
-        
-        if total_seconds < 60:
-            return "<1 minute ago"
-        elif total_seconds < 3600:  # Less than 1 hour
-            minutes = int(total_seconds / 60)
-            return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
-        elif total_seconds < 86400:  # Less than 24 hours
-            hours = int(total_seconds / 3600)
-            return f"{hours} hour{'s' if hours != 1 else ''} ago"
-        else:  # 24 hours or more
-            days = int(total_seconds / 86400)
-            return f"{days} day{'s' if days != 1 else ''} ago"
-    except Exception as e:
-        return "Unknown"
-
-def load_minecraft_template():
-    """Load the Minecraft message template from file."""
-    template = {}
-    try:
-        with open('minecraft_message.txt', 'r', encoding='utf-8') as f:
-            content = f.read()
-            # Parse sections - find [KEY] at start of line
-            import re
-            pattern = r'^\[([^\]]+)\]\s*\n((?:(?!\n\[)[^\n]*\n?)*)'
-            matches = re.finditer(pattern, content, re.MULTILINE)
-            for match in matches:
-                key = match.group(1).strip()
-                value = match.group(2).strip()
-                template[key] = value
-    except FileNotFoundError:
-        # Return default template if file doesn't exist
-        template = {
-            'LOADING_MESSAGE': '🔄 Fetching server information...',
-            'ERROR_NO_IP': '❌ Could not fetch public IP address.',
-            'ERROR_EXCEPTION': '❌ Error fetching IP: {error}',
-            'EMBED_TITLE': '🎮 Minecraft Server',
-            'EMBED_DESCRIPTION': '{statusEmoji} Status: **{statusText}**',
-            'FIELD_1_NAME': 'Server Address',
-            'FIELD_1_VALUE': '`{serverAddress}`',
-            'FIELD_2_NAME': 'Map URL',
-            'FIELD_2_VALUE': '[View Map]({mapUrl})',
-            'FIELD_3_NAME': '📅 CLIENT LAST UPDATED',
-            'FIELD_3_VALUE': '**🕒 {lastUpdated}**',
-            'FIELD_4_NAME': 'Latest Client Version',
-            'FIELD_4_VALUE': '**{versionName}**\n{versionDescription}',
-            'FIELD_5_NAME': 'Download Client',
-            'FIELD_5_VALUE': '[Google Drive Link]({driveLink})',
-            'FIELD_6_NAME': 'Instructions',
-            'FIELD_6_VALUE': '{instructions}',
-            'VERSION_NAME': '1.20.1',
-            'VERSION_DESCRIPTION': 'Forge modded client with performance mods',
-            'DRIVE_LINK': 'https://drive.google.com/your-link-here',
-            'INSTRUCTIONS': '1. Download the client from the link above\n2. Extract to your Minecraft folder\n3. Run the launcher and connect!',
-            'LAST_UPDATED_DATE': '2026-02-12-14-30',
-            'BOT_STATUS_TYPE': 'playing',
-            'BOT_STATUS_TEXT': 'Type !minecraft for server info',
-            'BOT_STATUS_STATE': 'online',
-        }
-    return template
-
-def load_special_message():
-    """Load channel id (line 1) and message body (remaining lines) from special.txt."""
-    try:
-        with open(SPECIAL_MESSAGE_FILE, 'r', encoding='utf-8') as f:
-            lines = f.read().splitlines()
-    except FileNotFoundError:
-        return None, None, "special.txt is missing."
-    except Exception as e:
-        print(f"Error reading {SPECIAL_MESSAGE_FILE}: {e}")
-        return None, None, "Failed to read special.txt."
-
-    if not lines:
-        return None, None, "special.txt is empty."
-
-    channel_line = lines[0].strip()
-    if not channel_line.isdigit():
-        return None, None, "First line must be a numeric channel ID."
-
-    message_body = "\n".join(lines[1:]).strip()
-    if not message_body:
-        return None, None, "Message body is empty. Put message from line 2 onward."
-
-    return int(channel_line), message_body, None
 
 def find_best_match(query):
     """Smart search for local files."""
@@ -214,145 +119,137 @@ def find_best_match(query):
     close_matches = difflib.get_close_matches(query, files, n=1, cutoff=0.5)
     return close_matches[0] if close_matches else None
 
+async def ensure_voice_connected(ctx):
+    """Ensure bot is connected to user's voice channel. Returns True on success."""
+    if ctx.voice_client and ctx.voice_client.is_connected():
+        return True
+    
+    if not ctx.author.voice:
+        await ctx.send("❌ You must be in a voice channel first.")
+        return False
+    
+    try:
+        await ctx.author.voice.channel.connect(timeout=10.0, reconnect=True)
+        await asyncio.sleep(0.5)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to connect to voice channel: {e}")
+        await ctx.send(f"❌ Failed to connect: {e}")
+        return False
+
 async def play_next(ctx):
-    """Plays the next item in the queue with volume control."""
+    """Plays the next item in the queue with volume control. Must be called within play_next_lock."""
     global current_volume
 
-    async with play_next_lock:
-        # Check if voice client exists and is connected
-        if not ctx.voice_client or not ctx.voice_client.is_connected():
-            print("🔴 DEBUG: Voice client not connected, cannot play next song")
-            return
+    # Check if voice client exists and is connected
+    if not ctx.voice_client or not ctx.voice_client.is_connected():
+        logger.debug("Voice client not connected, cannot play next song")
+        return
 
-        # Guard against concurrent starters.
-        if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
-            return
+    # Guard against concurrent starters.
+    if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
+        return
 
-        if not song_queue:
-            return
+    if not song_queue:
+        return
 
-        song = song_queue.pop(0)
+    song = song_queue.pop(0)
 
-        try:
-            print(f"🔴 DEBUG: Now playing - {song['type']}: {song['title']}")
-            # 1. Create the base Source
-            if song['type'] == 'local':
-                source_path = os.path.join(settings.MEDIA_FOLDER, song['data'])
-                source = discord.FFmpegPCMAudio(source_path)
-            elif song['type'] == 'youtube':
-                print(f"🔴 DEBUG: Creating FFmpeg source for YouTube")
+    try:
+        logger.debug(f"Now playing - {song['type']}: {song['title']}")
+        # 1. Create the base Source
+        if song['type'] == 'local':
+            source_path = os.path.join(settings.MEDIA_FOLDER, song['data'])
+            source = discord.FFmpegPCMAudio(source_path)
+        elif song['type'] == 'youtube':
+            logger.debug(f"Creating FFmpeg source for YouTube: {song['data']}")
 
-                # Use discord.py's recommended approach with loop
-                loop = asyncio.get_event_loop()
-                data = await loop.run_in_executor(None, lambda: ytdl.extract_info(song['data'], download=False))
+            # Use discord.py's recommended approach with executor (non-blocking)
+            loop = asyncio.get_event_loop()
+            data = await loop.run_in_executor(None, lambda: ytdl.extract_info(song['data'], download=False))
 
-                if 'entries' in data:
-                    data = data['entries'][0]
+            if 'entries' in data:
+                data = data['entries'][0]
 
-                filename = data['url']
-                print(f"🔴 DEBUG: Stream URL obtained: {filename[:100]}")
-                print(f"🔴 DEBUG: Format: {data.get('format_id')}, ext: {data.get('ext')}")
+            filename = data['url']
+            logger.debug(f"Stream URL obtained: {filename[:100]}...")
+            logger.debug(f"Format: {data.get('format_id')}, ext: {data.get('ext')}")
 
-                source = discord.FFmpegPCMAudio(filename, **FFMPEG_OPTIONS)
-            elif song['type'] == 'url':
-                print(f"🔴 DEBUG: Creating FFmpeg source for generic URL")
-                source = discord.FFmpegPCMAudio(
-                    song['data'],
-                    before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-                    options="-vn"
-                )
-            else:
-                raise ValueError(f"Unknown song type: {song['type']}")
+            source = discord.FFmpegPCMAudio(filename, **FFMPEG_OPTIONS)
+        elif song['type'] == 'url':
+            logger.debug(f"Creating FFmpeg source for generic URL: {song['data']}")
+            source = discord.FFmpegPCMAudio(
+                song['data'],
+                before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+                options="-vn"
+            )
+        else:
+            raise ValueError(f"Unknown song type: {song['type']}")
 
-            # 2. Apply Volume Transformer
-            # This wrapper allows us to change volume
-            source = discord.PCMVolumeTransformer(source)
-            source.volume = current_volume
+        # 2. Apply Volume Transformer
+        source = discord.PCMVolumeTransformer(source)
+        source.volume = current_volume
 
-            # 3. Play - double check connection and playback state before playing
-            if ctx.voice_client and ctx.voice_client.is_connected():
-                if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
-                    # Another call started playback while we were preparing this source.
-                    song_queue.insert(0, song)
-                    return
+        # 3. Play - double check connection and playback state before playing
+        if ctx.voice_client and ctx.voice_client.is_connected():
+            if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
+                # Another call started playback while we were preparing this source.
+                song_queue.insert(0, song)
+                return
 
-                def after_playback(error):
-                    if error:
-                        print(f"🔴 DEBUG: Playback callback error: {error}")
-                    bot.loop.call_soon_threadsafe(lambda: bot.loop.create_task(play_next(ctx)))
+            def after_playback(error):
+                """Called after playback ends. Schedules next song with proper lock protection."""
+                if error:
+                    logger.error(f"Playback callback error: {error}")
+                # Schedule play_next with lock to prevent race conditions
+                async def next_with_lock():
+                    async with play_next_lock:
+                        if ctx.voice_client and ctx.voice_client.is_connected():
+                            await play_next(ctx)
+                bot.loop.call_soon_threadsafe(lambda: bot.loop.create_task(next_with_lock()))
 
-                ctx.voice_client.play(source, after=after_playback)
-                await ctx.send(f"🎶 **Now Playing:** {song['title']} (Vol: {int(current_volume * 100)}%)")
-            else:
-                print("🔴 DEBUG: Lost connection before playing")
-                song_queue.insert(0, song)  # Put song back in queue
-                await ctx.send("❌ Lost voice connection")
+            ctx.voice_client.play(source, after=after_playback)
+            await ctx.send(f"🎶 **Now Playing:** {song['title']} (Vol: {int(current_volume * 100)}%)")
+        else:
+            logger.warning("Lost connection before playing")
+            song_queue.insert(0, song)  # Put song back in queue
+            await ctx.send("❌ Lost voice connection")
 
-        except Exception as e:
-            print(f"🔴 DEBUG ERROR in play_next:")
-            print(traceback.format_exc())
-            await ctx.send(f"❌ Error playing: {e}")
-            # Try next song after a small delay
-            await asyncio.sleep(1)
-            if ctx.voice_client and ctx.voice_client.is_connected():
-                bot.loop.create_task(play_next(ctx))
+    except Exception as e:
+        logger.error(f"Error in play_next: {e}", exc_info=True)
+        await ctx.send(f"❌ Error playing: {e}")
+        # Try next song after a small delay
+        await asyncio.sleep(1)
+        if ctx.voice_client and ctx.voice_client.is_connected():
+            async with play_next_lock:
+                await play_next(ctx)
 
 # --- EVENTS ---
 
-async def set_bot_status():
-    """Set bot status from template."""
-    template = load_minecraft_template()
-    status_type = template.get('BOT_STATUS_TYPE', 'playing').lower()
-    status_text = template.get('BOT_STATUS_TEXT', 'Type !help for commands')
-    status_state = template.get('BOT_STATUS_STATE', 'online').lower()
-    
-    # Map activity types
-    if status_type == 'playing':
-        activity = discord.Game(name=status_text)
-    elif status_type == 'listening':
-        activity = discord.Activity(type=discord.ActivityType.listening, name=status_text)
-    elif status_type == 'watching':
-        activity = discord.Activity(type=discord.ActivityType.watching, name=status_text)
-    elif status_type == 'streaming':
-        activity = discord.Streaming(name=status_text, url="https://twitch.tv/placeholder")
-    else:
-        activity = discord.Game(name=status_text)
-    
-    # Map status states
-    if status_state == 'online':
-        discord_status = discord.Status.online
-    elif status_state == 'idle':
-        discord_status = discord.Status.idle
-    elif status_state == 'dnd' or status_state == 'do_not_disturb':
-        discord_status = discord.Status.dnd
-    elif status_state == 'invisible':
-        discord_status = discord.Status.invisible
-    else:
-        discord_status = discord.Status.online
-    
-    await bot.change_presence(activity=activity, status=discord_status)
-
 @bot.event
 async def on_ready():
+    logger.info(f'Logged in as {bot.user}')
     print(f'Logged in as {bot.user}')
     print('Administrator mode: OFF')
-    await set_bot_status()
-    print('Bot status set from template')
 
 @bot.event
 async def on_command_error(ctx, error):
     """Handles permission errors nicely."""
     if isinstance(error, commands.CommandNotFound):
-        pass # Ignore invalid commands
+        pass  # Ignore invalid commands
     elif isinstance(error, commands.MissingPermissions):
         await ctx.send("❌ You don't have permission to use this command.")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send(f"❌ Invalid argument provided. {error}")
     else:
+        logger.error(f"Command error in {ctx.command}: {error}", exc_info=True)
         await ctx.send(f"❌ An error occurred: {error}")
 
 # --- COMMANDS ---
 
 @bot.command()
 async def join(ctx):
+    """Joins the user's voice channel."""
     if ctx.author.voice:
         channel = ctx.author.voice.channel
         if ctx.voice_client:
@@ -360,23 +257,16 @@ async def join(ctx):
             await ctx.send(f"🔄 Moved to **{channel}**")
         else:
             await channel.connect(timeout=10.0, reconnect=True)
-            await asyncio.sleep(1)  # Give connection time to stabilize
+            await asyncio.sleep(0.5)
             await ctx.send(f"👋 Joined **{channel}**")
     else:
-        await ctx.send("You need to be in a voice channel first.")
+        await ctx.send("❌ You need to be in a voice channel first.")
 
 @bot.command()
 async def play(ctx, *, query):
-    """Plays LOCAL file."""
-    if not ctx.voice_client or not ctx.voice_client.is_connected():
-        if ctx.author.voice: 
-            try:
-                await ctx.author.voice.channel.connect(timeout=10.0, reconnect=True)
-                await asyncio.sleep(1)  # Give connection time to stabilize
-            except Exception as e:
-                return await ctx.send(f"❌ Failed to connect: {e}")
-        else: 
-            return await ctx.send("Join a voice channel first.")
+    """Plays a LOCAL file from the media folder. Usage: !play <filename>"""
+    if not await ensure_voice_connected(ctx):
+        return
 
     # Verify connection
     if not ctx.voice_client or not ctx.voice_client.is_connected():
@@ -389,39 +279,33 @@ async def play(ctx, *, query):
     song_obj = {'type': 'local', 'title': filename, 'data': filename}
     song_queue.append(song_obj)
 
-    if not ctx.voice_client.is_playing():
-        await play_next(ctx)
-    else:
-        await ctx.send(f"✅ Added to queue: `{filename}`")
+    async with play_next_lock:
+        if not ctx.voice_client.is_playing():
+            await play_next(ctx)
+        else:
+            await ctx.send(f"✅ Added to queue: `{filename}`")
 
 @bot.command()
 async def yt(ctx, *, query):
-    """Plays from YouTube (Url or Search)."""
-    if not ctx.voice_client or not ctx.voice_client.is_connected():
-        if ctx.author.voice: 
-            try:
-                await ctx.author.voice.channel.connect(timeout=10.0, reconnect=True)
-                await asyncio.sleep(1)  # Give connection time to stabilize
-            except Exception as e:
-                return await ctx.send(f"❌ Failed to connect: {e}")
-        else: 
-            return await ctx.send("Join a voice channel first.")
+    """Plays from YouTube (URL or search). Usage: !yt <url or search query>"""
+    if not await ensure_voice_connected(ctx):
+        return
 
     # Verify connection
     if not ctx.voice_client or not ctx.voice_client.is_connected():
         return await ctx.send("❌ Failed to connect to voice channel.")
 
     # 1. Determine if the user provided a LINK or a SEARCH PHRASE
-    # We check if it starts with http or www
     if query.startswith(("http://", "https://", "www.")):
         search_query = query
-        await ctx.send(f"🔗 Loading Link...")
+        await ctx.send(f"🔗 Loading link...")
     else:
         search_query = f"ytsearch:{query}"
         await ctx.send(f"🔎 Searching YouTube for: **{query}**...")
 
     try:
-        data = ytdl.extract_info(search_query, download=False)
+        # Run blocking yt-dlp call in executor to avoid freezing the event loop
+        data = await asyncio.to_thread(ytdl.extract_info, search_query, False)
         
         # 3. Handle Search Results vs Direct Links
         if 'entries' in data:
@@ -432,43 +316,43 @@ async def yt(ctx, *, query):
         title = video_data['title']
 
         if is_blacklisted_title(title):
-            return await ctx.send("This song is in blacklist")
+            return await ctx.send("❌ This song is in the blacklist.")
 
         # Use webpage_url - this will be processed by yt-dlp again during playback
         webpage_url = video_data.get('webpage_url') or video_data.get('url')
         
         if not webpage_url:
-            print(f"🔴 DEBUG: No URL found. Available keys: {video_data.keys()}")
+            logger.error(f"No URL found in video data. Keys: {list(video_data.keys())}")
             return await ctx.send("❌ Error: Could not extract URL from video.")
         
-        print(f"🔴 DEBUG: Using webpage URL: {webpage_url}")
+        logger.debug(f"Using webpage URL: {webpage_url}")
         
         song_obj = {'type': 'youtube', 'title': title, 'data': webpage_url}
         song_queue.append(song_obj)
-        print(f"🔴 DEBUG: Added song to queue - Title: {title}")
+        logger.debug(f"Added song to queue - Title: {title}")
 
         # Double-check voice connection before playing
         if not ctx.voice_client:
             return await ctx.send("❌ Lost voice connection.")
 
-        if not ctx.voice_client.is_playing():
-            await play_next(ctx)
-        else:
-            await ctx.send(f"✅ Added to queue: `{title}`")
+        async with play_next_lock:
+            if not ctx.voice_client.is_playing():
+                await play_next(ctx)
+            else:
+                await ctx.send(f"✅ Added to queue: `{title}`")
 
     except Exception as e:
-        print(f"🔴 DEBUG ERROR in yt command:")
-        print(traceback.format_exc())
+        logger.error(f"Error in yt command: {e}", exc_info=True)
         await ctx.send(f"❌ Error: {e}")
 
 @bot.command()
 async def volume(ctx, volume: int):
-    """Sets volume (0-100)."""
+    """Sets volume (0-100). Usage: !volume <0-100>"""
     global current_volume
     
-    # Clamp value between 0 and 100
-    if volume < 0: volume = 0
-    if volume > 100: volume = 100
+    # Validate input
+    if not (0 <= volume <= 100):
+        return await ctx.send(f"❌ Volume must be between 0-100. You entered: {volume}")
 
     # Convert to float (0.0 - 1.0)
     current_volume = volume / 100
@@ -480,11 +364,13 @@ async def volume(ctx, volume: int):
     await ctx.send(f"🔊 Volume set to **{volume}%**")
 
 @bot.command()
-
 async def skip(ctx):
+    """Skips the current song."""
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.stop()
         await ctx.send("⏭️ Skipped.")
+    else:
+        await ctx.send("❌ Nothing is playing.")
 
 @bot.command()
 async def queue(ctx):
@@ -499,34 +385,31 @@ async def queue(ctx):
         # i+1 makes it human readable (1, 2, 3 instead of 0, 1, 2)
         queue_list += f"`{i+1}.` {song['title']}\n"
 
-    # Discord has a message limit of 2000 chars. 
-    # If queue is huge, just show the first 10.
-    if len(queue_list) > 1900:
-        await ctx.send(f"{queue_list[:1900]}...\n*(and more)*")
+    # Discord has a message limit; if queue is huge, show first N
+    max_chars = settings.DISCORD_MESSAGE_CHAR_LIMIT - settings.MESSAGE_BUFFER
+    if len(queue_list) > max_chars:
+        await ctx.send(f"{queue_list[:max_chars]}...\n*(and more)*")
     else:
         await ctx.send(queue_list)
 
 @bot.command()
 async def skipto(ctx, index: int):
-    """Skips to a specific number in the queue."""
-    global song_queue
-    
+    """Skips to a specific number in the queue. Usage: !skipto <position>"""
     if not ctx.voice_client or not ctx.voice_client.is_playing():
-        await ctx.send("Nothing is playing right now.")
+        await ctx.send("❌ Nothing is playing right now.")
         return
 
     if not song_queue:
-        await ctx.send("The queue is empty.")
+        await ctx.send("❌ The queue is empty.")
         return
 
     # Validate the number
     if index < 1 or index > len(song_queue):
-        await ctx.send(f"Invalid number. Please choose between 1 and {len(song_queue)}.")
-        return
+        return await ctx.send(f"❌ Invalid position. Please choose between 1 and {len(song_queue)}.")
 
     # Logic: Slice the queue to remove everything BEFORE the target
     # index-1 because users see 1-based, list is 0-based
-    song_queue = song_queue[index-1:]
+    song_queue[:] = song_queue[index-1:]
 
     # Stop the current song. This triggers 'play_next', which pulls from our NEW shortened queue.
     ctx.voice_client.stop()
@@ -540,146 +423,49 @@ async def clear(ctx):
 
 @bot.command()
 async def stop(ctx):
+    """Stops playback and disconnects from voice channel."""
     song_queue.clear()
     if ctx.voice_client:
         ctx.voice_client.stop()
         await ctx.voice_client.disconnect()
-        await ctx.send("🛑 Stopped.")
+        await ctx.send("🛑 Stopped and disconnected.")
+    else:
+        await ctx.send("❌ Not connected to a voice channel.")
+
+
 
 @bot.command()
-async def special(ctx):
-    """DM-only: send special.txt content using line 1 as target channel id."""
-    if ctx.guild is not None:
-        return await ctx.send(f"❌ Use this in DM only: `{settings.COMMAND_PREFIX}special`")
-
-    channel_id, special_message, error_text = load_special_message()
-    if error_text:
-        return await ctx.send(f"❌ {error_text}")
-
-    target_channel = bot.get_channel(channel_id)
-    if target_channel is None:
-        try:
-            target_channel = await bot.fetch_channel(channel_id)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            return await ctx.send("❌ Invalid channel ID or I cannot access that channel.")
-
-    if not hasattr(target_channel, 'send'):
-        return await ctx.send("❌ Target is not a message channel.")
-
+@commands.is_owner()
+async def reload_blacklist(ctx):
+    """Reloads the YouTube blacklist patterns from config.yaml. Owner only.
+    
+    Note: After editing config.yaml, run this command to reload patterns without restarting the bot.
+    """
+    global _blacklist_patterns
     try:
-        await target_channel.send(
-            special_message,
-            allowed_mentions=discord.AllowedMentions(everyone=True, roles=True, users=True)
-        )
-        await ctx.send(f"✅ Sent to channel: `{channel_id}`")
-    except discord.Forbidden:
-        await ctx.send("❌ I don't have permission to send there.")
-    except discord.HTTPException as e:
-        await ctx.send(f"❌ Failed to send message: {e}")
-
-@bot.command()
-async def minecraft(ctx):
-    """Returns Minecraft server connection info."""
-    global minecraft_server_ip, minecraft_server_online
-    
-    # Load template
-    template = load_minecraft_template()
-    
-    if minecraft_server_ip is None:
-        await ctx.send(template['LOADING_MESSAGE'])
-        # Try to get IP
-        try:
-            result = subprocess.run(
-                ['curl', 'ipv4.icanhazip.com'],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            if result.returncode == 0:
-                minecraft_server_ip = result.stdout.strip()
-            else:
-                return await ctx.send(template['ERROR_NO_IP'])
-        except Exception as e:
-            error_msg = template['ERROR_EXCEPTION'].replace('{error}', str(e))
-            return await ctx.send(error_msg)
-    
-    # Check if server is online by attempting socket connection
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(3)
-        # Try to connect to localhost on port 25565
-        result = sock.connect_ex((minecraft_server_ip, 25565))
-        sock.close()
-        minecraft_server_online = (result == 0)
+        # Reload config module to pick up changes from config.yaml
+        importlib.reload(settings)
+        _blacklist_patterns = load_yt_blacklist_patterns()
+        count = len(_blacklist_patterns)
+        await ctx.send(f"✅ Blacklist reloaded from config.yaml. {count} patterns loaded.")
+        logger.info(f"Blacklist reloaded from config.yaml with {count} patterns.")
     except Exception as e:
-        print(f"❌ Error checking Minecraft server: {e}")
-        minecraft_server_online = False
-    
-    # Prepare variables
-    server_address = f"{minecraft_server_ip}:25565"
-    map_url = f"http://{minecraft_server_ip}:8080"
-    status_emoji = "🟢" if minecraft_server_online else "🔴"
-    status_text = "Online" if minecraft_server_online else "Offline"
-    
-    # Calculate last updated time
-    last_updated_date = template.get('LAST_UPDATED_DATE', '')
-    last_updated_text = calculate_relative_time(last_updated_date) if last_updated_date else 'Unknown'
-    
-    # Replace variables in template
-    variables = {
-        '{serverAddress}': server_address,
-        '{mapUrl}': map_url,
-        '{statusEmoji}': status_emoji,
-        '{statusText}': status_text,
-        '{lastUpdated}': last_updated_text,
-        '{versionName}': template.get('VERSION_NAME', 'N/A'),
-        '{versionDescription}': template.get('VERSION_DESCRIPTION', ''),
-        '{driveLink}': template.get('DRIVE_LINK', 'https://drive.google.com'),
-        '{instructions}': template.get('INSTRUCTIONS', 'No instructions provided'),
-    }
-    
-    def replace_vars(text):
-        for var, value in variables.items():
-            text = text.replace(var, value)
-        return text
-    
-    # Build embed from template
-    embed = discord.Embed(
-        title=replace_vars(template['EMBED_TITLE']),
-        description=replace_vars(template['EMBED_DESCRIPTION']),
-        color=discord.Color.green() if minecraft_server_online else discord.Color.red()
-    )
-    embed.add_field(
-        name=replace_vars(template['FIELD_1_NAME']),
-        value=replace_vars(template['FIELD_1_VALUE']),
-        inline=False
-    )
-    embed.add_field(
-        name=replace_vars(template['FIELD_2_NAME']),
-        value=replace_vars(template['FIELD_2_VALUE']),
-        inline=False
-    )
-    embed.add_field(
-        name=replace_vars(template['FIELD_3_NAME']),
-        value=replace_vars(template['FIELD_3_VALUE']),
-        inline=False
-    )
-    embed.add_field(
-        name=replace_vars(template['FIELD_4_NAME']),
-        value=replace_vars(template['FIELD_4_VALUE']),
-        inline=False
-    )
-    embed.add_field(
-        name=replace_vars(template['FIELD_5_NAME']),
-        value=replace_vars(template['FIELD_5_VALUE']),
-        inline=False
-    )
-    embed.add_field(
-        name=replace_vars(template['FIELD_6_NAME']),
-        value=replace_vars(template['FIELD_6_VALUE']),
-        inline=False
-    )
-    
-    await ctx.send(embed=embed)
+        logger.error(f"Failed to reload blacklist: {e}", exc_info=True)
+        await ctx.send(f"❌ Failed to reload blacklist: {e}")
 
-bot.run(TOKEN)
+# Initialize blacklist patterns on startup
+@bot.event
+async def setup_hook():
+    """Called after the bot is logged in but before on_ready."""
+    global _blacklist_patterns
+    try:
+        _blacklist_patterns = load_yt_blacklist_patterns()
+        logger.info(f"Blacklist initialized with {len(_blacklist_patterns)} patterns.")
+    except Exception as e:
+        logger.error(f"Failed to initialize blacklist: {e}", exc_info=True)
+
+# Main bot startup
+if __name__ == '__main__':
+    logger.info("Starting MusicBot...")
+    print("Starting MusicBot...")
+    bot.run(TOKEN)
