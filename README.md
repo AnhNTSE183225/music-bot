@@ -46,3 +46,6 @@ To add or upgrade packages:
 3. Freeze to requirements.txt: `pip freeze > requirements.txt`
 4. Next time you run `.\run.ps1`, dependencies will auto-update
 5. Commit the updated `requirements.txt` to git
+
+# Prompt used
+You are a senior developer, you are obsessed with DRY principle and clean code
