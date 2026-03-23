@@ -50,6 +50,8 @@ current_volume = settings.DEFAULT_VOLUME
 play_next_lock = asyncio.Lock()
 votes_by_guild = {}
 next_queue_id = 1
+current_song = None  # Track the currently playing song for status display
+current_song = None  # Track the currently playing song for status display
 
 # Cache blacklist patterns at module level (load once on startup)
 _blacklist_patterns = []
@@ -80,6 +82,26 @@ def is_blacklisted_title(title):
         if pattern.search(title):
             return True
     return False
+
+async def update_bot_status(song_title):
+    """Update bot's status to show currently playing song."""
+    try:
+        activity = discord.Activity(
+            type=discord.ActivityType.playing,
+            name=song_title
+        )
+        await bot.change_presence(activity=activity)
+        logger.debug(f"Bot status updated to: {song_title}")
+    except Exception as e:
+        logger.warning(f"Failed to update bot status: {e}")
+
+async def clear_bot_status():
+    """Clear bot's status back to default (no activity)."""
+    try:
+        await bot.change_presence(activity=None)
+        logger.debug("Bot status cleared")
+    except Exception as e:
+        logger.warning(f"Failed to clear bot status: {e}")
 
 def find_best_match(query):
     """Smart search for local files."""
@@ -246,7 +268,7 @@ def validate_command_permissions_config():
 
 async def play_next(ctx):
     """Plays the next item in the queue with volume control. Must be called within play_next_lock."""
-    global current_volume
+    global current_volume, current_song
 
     # Check if voice client exists and is connected
     if not ctx.voice_client or not ctx.voice_client.is_connected():
@@ -258,9 +280,12 @@ async def play_next(ctx):
         return
 
     if not song_queue:
+        current_song = None
+        await clear_bot_status()
         return
 
     song = song_queue.pop(0)
+    current_song = song  # Track currently playing song
 
     try:
         logger.debug(f"Now playing - {song['type']}: {song['title']}")
@@ -318,6 +343,10 @@ async def play_next(ctx):
             if ctx.guild:
                 clear_votes(ctx.guild.id, action_key='skip')
             ctx.voice_client.play(source, after=after_playback)
+            
+            # Update bot's status to show currently playing song
+            await update_bot_status(song['title'])
+            
             await ctx.send(
                 f"🎶 **Now Playing:** {song['title']} "
                 f"(requested by {song.get('requester_mention', 'unknown')}, Vol: {int(current_volume * 100)}%)"
@@ -493,6 +522,13 @@ async def skip(ctx):
         await ctx.send("⏭️ Skipped by admin.")
         return
 
+    # Let the requester skip their own currently playing song directly.
+    if current_song and current_song.get('requester_id') == ctx.author.id:
+        clear_votes(ctx.guild.id, action_key='skip')
+        ctx.voice_client.stop()
+        await ctx.send("⏭️ Skipped your own song.")
+        return
+
     if mode == 'admin_only':
         await ctx.send("❌ Only administrators can use this command.")
         return
@@ -587,12 +623,15 @@ async def stop(ctx):
     if not await enforce_command_access(ctx, 'stop'):
         return
 
+    global current_song
+    current_song = None
     song_queue.clear()
     if ctx.guild:
         clear_votes(ctx.guild.id)
     if ctx.voice_client:
         ctx.voice_client.stop()
         await ctx.voice_client.disconnect()
+        await clear_bot_status()
         await ctx.send("🛑 Stopped and disconnected.")
     else:
         await ctx.send("❌ Not connected to a voice channel.")
