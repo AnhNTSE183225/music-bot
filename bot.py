@@ -52,6 +52,8 @@ votes_by_guild = {}
 next_queue_id = 1
 current_song = None  # Track the currently playing song for status display
 current_song = None  # Track the currently playing song for status display
+empty_voice_leave_tasks = {}
+EMPTY_VOICE_LEAVE_DELAY_SECONDS = 10
 
 # Cache blacklist patterns at module level (load once on startup)
 _blacklist_patterns = []
@@ -183,6 +185,18 @@ async def enforce_command_access(ctx, command_name):
     return True
 
 
+class BlockedUserError(commands.CheckFailure):
+    """Raised when a blocked user attempts to run a command."""
+
+
+@bot.check
+def enforce_blocked_users(ctx):
+    """Prevent blocked users from running any command."""
+    if ctx.author and ctx.author.id in settings.get_blocked_user_ids():
+        raise BlockedUserError(f"User {ctx.author.id} is blocked")
+    return True
+
+
 def clear_votes(guild_id, action_key=None):
     """Clear votes for one guild, or one action if action_key is provided."""
     if action_key is None:
@@ -196,6 +210,67 @@ def clear_votes(guild_id, action_key=None):
     guild_votes.pop(action_key, None)
     if not guild_votes:
         votes_by_guild.pop(guild_id, None)
+
+
+def get_non_bot_voice_member_count(voice_client):
+    """Count non-bot users in the bot's current voice channel."""
+    if not voice_client or not voice_client.channel:
+        return 0
+    return sum(1 for member in voice_client.channel.members if not member.bot)
+
+
+def cancel_empty_voice_leave_timer(guild_id):
+    """Cancel pending leave timer for one guild if it exists."""
+    task = empty_voice_leave_tasks.pop(guild_id, None)
+    if task and not task.done():
+        task.cancel()
+
+
+def ensure_empty_voice_leave_timer(guild):
+    """Start or stop leave timer depending on whether humans are in voice."""
+    if not guild:
+        return
+
+    voice_client = guild.voice_client
+    guild_id = guild.id
+
+    if not voice_client or not voice_client.is_connected() or get_non_bot_voice_member_count(voice_client) > 0:
+        cancel_empty_voice_leave_timer(guild_id)
+        return
+
+    existing = empty_voice_leave_tasks.get(guild_id)
+    if existing and not existing.done():
+        return
+
+    async def leave_if_still_empty():
+        global current_song
+        try:
+            await asyncio.sleep(EMPTY_VOICE_LEAVE_DELAY_SECONDS)
+            fresh_voice_client = guild.voice_client
+            if not fresh_voice_client or not fresh_voice_client.is_connected():
+                return
+            if get_non_bot_voice_member_count(fresh_voice_client) > 0:
+                return
+
+            current_song = None
+            song_queue.clear()
+            clear_votes(guild_id)
+            fresh_voice_client.stop()
+            await fresh_voice_client.disconnect()
+            await clear_bot_status()
+            logger.info(
+                "Disconnected from voice in guild %s after %s seconds with no listeners.",
+                guild_id,
+                EMPTY_VOICE_LEAVE_DELAY_SECONDS,
+            )
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.warning("Failed auto-leave in guild %s: %s", guild_id, e)
+        finally:
+            empty_voice_leave_tasks.pop(guild_id, None)
+
+    empty_voice_leave_tasks[guild_id] = bot.loop.create_task(leave_if_still_empty())
 
 
 def get_skip_vote_eligible_members(ctx, same_channel_only):
@@ -376,6 +451,9 @@ async def on_command_error(ctx, error):
     """Handles permission errors nicely."""
     if isinstance(error, commands.CommandNotFound):
         pass  # Ignore invalid commands
+    elif isinstance(error, BlockedUserError):
+        await ctx.send("❌ You are blocked from using this bot.")
+        logger.info("Blocked user %s attempted command '%s'", ctx.author.id, ctx.message.content)
     elif isinstance(error, commands.MissingPermissions):
         await ctx.send("❌ You don't have permission to use this command.")
     elif isinstance(error, commands.BadArgument):
@@ -383,6 +461,13 @@ async def on_command_error(ctx, error):
     else:
         logger.error(f"Command error in {ctx.command}: {error}", exc_info=True)
         await ctx.send(f"❌ An error occurred: {error}")
+
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """Auto-disconnect after delay when the bot is alone in voice."""
+    # Re-evaluate timer whenever anyone moves/joins/leaves voice in this guild.
+    ensure_empty_voice_leave_timer(member.guild)
 
 # --- COMMANDS ---
 
@@ -400,6 +485,9 @@ async def join(ctx):
             await ctx.send(f"👋 Joined **{channel}**")
     else:
         await ctx.send("❌ You need to be in a voice channel first.")
+
+    if ctx.guild:
+        ensure_empty_voice_leave_timer(ctx.guild)
 
 @bot.command()
 async def play(ctx, *, query):
@@ -627,6 +715,7 @@ async def stop(ctx):
     current_song = None
     song_queue.clear()
     if ctx.guild:
+        cancel_empty_voice_leave_timer(ctx.guild.id)
         clear_votes(ctx.guild.id)
     if ctx.voice_client:
         ctx.voice_client.stop()

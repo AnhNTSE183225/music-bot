@@ -110,6 +110,21 @@ def get_permissions_config():
     return _config.get('permissions', {}) or {}
 
 
+def get_blocked_user_ids():
+    """Get blocked user IDs from config as a set of ints."""
+    permissions_cfg = get_permissions_config()
+    raw_ids = permissions_cfg.get('blocked_user_ids', []) or []
+
+    blocked_ids = set()
+    for raw_id in raw_ids:
+        try:
+            blocked_ids.add(int(raw_id))
+        except (TypeError, ValueError):
+            logger.warning("Ignoring invalid blocked_user_ids entry: %r", raw_id)
+
+    return blocked_ids
+
+
 def get_command_permission_mode(command_name):
     """Get mode for a command. Modes: open, admin_only, vote_if_non_admin."""
     commands_cfg = get_permissions_config().get('commands', {}) or {}
