@@ -447,7 +447,7 @@ def validate_command_permissions_config():
 
 async def play_next(ctx):
     """Plays the next item in the queue with volume control. Must be called within play_next_lock."""
-    global current_volume, current_song
+    global current_song
 
     # Check if voice client exists and is connected
     if not ctx.voice_client or not ctx.voice_client.is_connected():
