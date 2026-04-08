@@ -67,6 +67,48 @@ Write-Host ""
 Write-Host "Starting bot..." -ForegroundColor Cyan
 Write-Host ""
 
+# Resolve runtime mode from config.yaml (default: prod)
+$runtimeMode = "prod"
+$runtimeModeOutput = & "$venvPython" "-c" "import yaml; c=yaml.safe_load(open('config.yaml','r',encoding='utf-8')) or {}; print(str((c.get('runtime',{}) or {}).get('mode','prod')).strip().lower())"
+if ($LASTEXITCODE -eq 0 -and $runtimeModeOutput) {
+    $modeCandidate = $runtimeModeOutput.Trim().ToLower()
+    if ($modeCandidate -in @("debug", "prod")) {
+        $runtimeMode = $modeCandidate
+    }
+}
+
+# Create external log file targets
+$logsDir = Join-Path (Get-Location) "logs"
+if (-not (Test-Path $logsDir)) {
+    New-Item -ItemType Directory -Path $logsDir | Out-Null
+}
+
+$timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$prodLogFile = Join-Path $logsDir "musicbot-prod.log"
+
+if ($runtimeMode -eq "debug") {
+    $debugLogFile = Join-Path $logsDir "musicbot-debug-$timestamp.log"
+    $env:MUSICBOT_RUNTIME_MODE = "debug"
+    $env:MUSICBOT_LOG_LEVEL = "DEBUG"
+    $env:MUSICBOT_PLAYBACK_DEBUG_METRICS = "true"
+    $env:MUSICBOT_LOG_FILE = $debugLogFile
+
+    Write-Host "Runtime mode: DEBUG" -ForegroundColor Yellow
+    Write-Host "Debug log file: $debugLogFile" -ForegroundColor Yellow
+    Write-Host "Log level override: DEBUG" -ForegroundColor Yellow
+} else {
+    $env:MUSICBOT_RUNTIME_MODE = "prod"
+    $env:MUSICBOT_LOG_LEVEL = "INFO"
+    $env:MUSICBOT_PLAYBACK_DEBUG_METRICS = "false"
+    $env:MUSICBOT_LOG_FILE = $prodLogFile
+
+    Write-Host "Runtime mode: PROD" -ForegroundColor Green
+    Write-Host "Production log file: $prodLogFile" -ForegroundColor Green
+    Write-Host "Log level override: INFO" -ForegroundColor Green
+}
+
+Write-Host ""
+
 # Run the bot
 & "$venvPython" ".\bot.py"
 

@@ -2,10 +2,38 @@ import os
 import yaml
 import logging
 
+try:
+    from ruamel.yaml import YAML
+except ImportError:
+    YAML = None
+
 logger = logging.getLogger(__name__)
 
 # Load configuration from config.yaml
 CONFIG_FILE = 'config.yaml'
+
+_yaml_rt = None
+if YAML is not None:
+    _yaml_rt = YAML()
+    _yaml_rt.preserve_quotes = True
+    _yaml_rt.width = 4096
+    _yaml_rt.indent(mapping=2, sequence=4, offset=2)
+
+
+def _get_bool(value, default=False):
+    """Parse booleans from Python values and common string forms."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {'1', 'true', 'yes', 'on'}
+    return bool(value)
+
+
+def _get_env_bool(name, default=False):
+    """Parse boolean from environment variable with fallback default."""
+    return _get_bool(os.getenv(name), default)
 
 def load_config():
     """Load configuration from YAML file with sensible defaults."""
@@ -16,7 +44,10 @@ def load_config():
     
     try:
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-            config = yaml.safe_load(f)
+            if _yaml_rt is not None:
+                config = _yaml_rt.load(f)
+            else:
+                config = yaml.safe_load(f)
         if config is None:
             raise ValueError(f"{CONFIG_FILE} is empty")
         return config
@@ -26,6 +57,13 @@ def load_config():
 # Load the configuration
 _config = load_config()
 
+# --- Runtime Mode ---
+_runtime_cfg = _config.get('runtime', {}) or {}
+RUNTIME_MODE = str(os.getenv('MUSICBOT_RUNTIME_MODE', _runtime_cfg.get('mode', 'prod'))).strip().lower()
+if RUNTIME_MODE not in {'debug', 'prod'}:
+    logger.warning("Invalid runtime.mode '%s' in config/env; falling back to 'prod'", RUNTIME_MODE)
+    RUNTIME_MODE = 'prod'
+
 # --- Discord Settings ---
 COMMAND_PREFIX = _config.get('discord', {}).get('command_prefix', '!')
 TOKEN_ENV_VAR = _config.get('discord', {}).get('token_env_var', 'DISCORD_TOKEN')
@@ -34,11 +72,18 @@ TOKEN_ENV_VAR = _config.get('discord', {}).get('token_env_var', 'DISCORD_TOKEN')
 DEFAULT_VOLUME = _config.get('playback', {}).get('default_volume', 0.5)
 CONNECTION_TIMEOUT = _config.get('playback', {}).get('connection_timeout', 10.0)
 CONNECTION_STABILIZE_DELAY = _config.get('playback', {}).get('connection_stabilize_delay', 0.5)
+_playback_debug_default = (RUNTIME_MODE == 'debug')
+PLAYBACK_DEBUG_METRICS = _get_env_bool(
+    'MUSICBOT_PLAYBACK_DEBUG_METRICS',
+    _get_bool(_config.get('playback', {}).get('debug_metrics', _playback_debug_default), _playback_debug_default),
+)
+YT_STREAM_CACHE_TTL_SECONDS = int(_config.get('playback', {}).get('yt_stream_cache_ttl_seconds', 300))
 
 # --- Media and Storage ---
 MEDIA_FOLDER = _config.get('storage', {}).get('media_folder', 'media')
-LOG_FILE = _config.get('storage', {}).get('log_file', 'musicbot.log')
-LOG_LEVEL = _config.get('storage', {}).get('log_level', 'INFO')
+LOG_FILE = os.getenv('MUSICBOT_LOG_FILE', _config.get('storage', {}).get('log_file', 'musicbot.log'))
+_default_log_level = 'DEBUG' if RUNTIME_MODE == 'debug' else 'INFO'
+LOG_LEVEL = os.getenv('MUSICBOT_LOG_LEVEL', _config.get('storage', {}).get('log_level', _default_log_level))
 
 # --- Message Settings ---
 DISCORD_MESSAGE_CHAR_LIMIT = _config.get('message', {}).get('embed_char_limit', 2000)
@@ -93,7 +138,7 @@ def get_ytdl_options():
 def get_ffmpeg_options():
     """Build FFmpeg options from config."""
     ffmpeg_cfg = _config.get('ffmpeg', {})
-    
+
     return {
         'before_options': ffmpeg_cfg.get('before_options', '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'),
         'options': ffmpeg_cfg.get('audio_only', '-vn'),
@@ -103,6 +148,36 @@ def get_ffmpeg_options():
 YTDL_OPTIONS = get_ytdl_options()
 FFMPEG_OPTIONS = get_ffmpeg_options()
 YT_BLACKLIST_PATTERNS = get_blacklist_patterns()
+
+def save_config():
+    """Save the current global _config to config.yaml."""
+    try:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            if _yaml_rt is not None:
+                _yaml_rt.dump(_config, f)
+            else:
+                yaml.safe_dump(_config, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save config: {e}")
+        return False
+
+
+def update_blocked_user_ids(user_ids_list):
+    """Update blocked_user_ids in the config and save."""
+    if 'permissions' not in _config:
+        _config['permissions'] = {}
+    _config['permissions']['blocked_user_ids'] = list(user_ids_list)
+    return save_config()
+
+
+def update_blacklist_patterns(patterns_list):
+    """Update blacklist_patterns in the config and save."""
+    if 'youtube' not in _config:
+        _config['youtube'] = {}
+    _config['youtube']['blacklist_patterns'] = list(patterns_list)
+    return save_config()
+
 
 # --- Permissions and Role Rules ---
 def get_permissions_config():
