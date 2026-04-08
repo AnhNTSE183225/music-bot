@@ -104,6 +104,33 @@ YTDL_OPTIONS = get_ytdl_options()
 FFMPEG_OPTIONS = get_ffmpeg_options()
 YT_BLACKLIST_PATTERNS = get_blacklist_patterns()
 
+def save_config():
+    """Save the current global _config to config.yaml."""
+    try:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            yaml.dump(_config, f, default_flow_style=False, sort_keys=False)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save config: {e}")
+        return False
+
+
+def update_blocked_user_ids(user_ids_list):
+    """Update blocked_user_ids in the config and save."""
+    if 'permissions' not in _config:
+        _config['permissions'] = {}
+    _config['permissions']['blocked_user_ids'] = list(user_ids_list)
+    return save_config()
+
+
+def update_blacklist_patterns(patterns_list):
+    """Update blacklist_patterns in the config and save."""
+    if 'youtube' not in _config:
+        _config['youtube'] = {}
+    _config['youtube']['blacklist_patterns'] = list(patterns_list)
+    return save_config()
+
+
 # --- Permissions and Role Rules ---
 def get_permissions_config():
     """Get permissions configuration from config."""

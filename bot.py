@@ -784,6 +784,77 @@ async def remove(ctx, index: int):
     )
 
 
+@bot.command()
+async def block(ctx, user_id: int = None):
+    """Adds or removes a user from the blocked list. Usage: !block <user_id>"""
+    if not await enforce_command_access(ctx, 'block'):
+        return
+
+    if user_id is None:
+        blocked_ids = settings.get_blocked_user_ids()
+        if not blocked_ids:
+            return await ctx.send("📝 No users are currently blocked.")
+        return await ctx.send(f"📝 **Blocked User IDs:** {', '.join(map(str, blocked_ids))}")
+
+    blocked_ids = settings.get_blocked_user_ids()
+    if user_id in blocked_ids:
+        blocked_ids.remove(user_id)
+        if settings.update_blocked_user_ids(blocked_ids):
+            await ctx.send(f"✅ User `{user_id}` has been **unblocked**.")
+        else:
+            await ctx.send("❌ Failed to update configuration.")
+    else:
+        blocked_ids.add(user_id)
+        if settings.update_blocked_user_ids(blocked_ids):
+            await ctx.send(f"✅ User `{user_id}` has been **blocked**.")
+        else:
+            await ctx.send("❌ Failed to update configuration.")
+
+
+@bot.command()
+async def blacklist(ctx, *, pattern: str = None):
+    """Lists or adds/removes patterns from the YouTube title blacklist. Usage: !blacklist [pattern]"""
+    if not await enforce_command_access(ctx, 'blacklist'):
+        return
+
+    global _blacklist_patterns
+    patterns = settings.get_blacklist_patterns()
+
+    if pattern is None:
+        if not patterns:
+            return await ctx.send("📝 The YouTube title blacklist is empty.")
+        
+        patterns_text = "**Blacklist Patterns:**\n"
+        for i, p in enumerate(patterns):
+            patterns_text += f"`{i+1}.` `{p}`\n"
+        
+        if len(patterns_text) > 1900:
+            await ctx.send(f"{patterns_text[:1900]}...\n*(and more)*")
+        else:
+            await ctx.send(patterns_text)
+        return
+
+    if pattern in patterns:
+        patterns.remove(pattern)
+        if settings.update_blacklist_patterns(patterns):
+            _blacklist_patterns = load_yt_blacklist_patterns()
+            await ctx.send(f"✅ Removed pattern from blacklist: `{pattern}`")
+        else:
+            await ctx.send("❌ Failed to update configuration.")
+    else:
+        # Basic validation of regex
+        try:
+            re.compile(pattern)
+        except re.error:
+            return await ctx.send(f"❌ Invalid regex pattern: `{pattern}`")
+
+        patterns.append(pattern)
+        if settings.update_blacklist_patterns(patterns):
+            _blacklist_patterns = load_yt_blacklist_patterns()
+            await ctx.send(f"✅ Added pattern to blacklist: `{pattern}`")
+        else:
+            await ctx.send("❌ Failed to update configuration.")
+
 
 @bot.command()
 @commands.is_owner()
