@@ -28,6 +28,13 @@ youtube:
     - "(?i)(copyright|dmca|removed)"
     # Block ads or trailers
     - "(?i)(trailer|advertisement|promo)"
+    # Historical blocked patterns (from legacy yt_blacklist.txt)
+    - "(?i)\\b9+\\s*[dđ](?:[oóòỏõọôồốổỗộơờớởỡợ])(?:[aáàảãạăằắẳẵặâầấẩẫậ])\\s*(?:h(?:[oóòỏõọôồốổỗộơờớởỡợ])(?:[aáàảãạăằắẳẵặâầấẩẫậ])\\s+)?h(?:[oóòỏõọôồốổỗộơờớởỡợ])ng\\b"
+    - "(?i)\\brap\\s*vi(?:e|ệ)t\\b"
+    - "(?i)\\bcover\\b"
+    - "(?i)\\bsi(?:e|ê)u\\s*h(?:a|à|á|ả|ã|ạ)i\\b"
+    - "(?i)\\bkawaii\\s*kutegomen\\b"
+    - "(?i)\\bkejo\\b"
 
 # Discord Message Settings
 message:
@@ -63,7 +70,6 @@ ffmpeg:
 permissions:
   # Blocked users cannot run any bot command.
   blocked_user_ids: []
-
   commands:
     # open: anyone can run
     # admin_only: only users with Discord Administrator permission can run
@@ -108,4 +114,13 @@ permissions:
       mode: "admin_only"
 
     reload_blacklist:
+      mode: "admin_only"
+
+    block:
+      mode: "admin_only"
+
+    unblock:
+      mode: "admin_only"
+
+    blacklist:
       mode: "admin_only"

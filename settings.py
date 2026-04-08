@@ -2,10 +2,22 @@ import os
 import yaml
 import logging
 
+try:
+    from ruamel.yaml import YAML
+except ImportError:
+    YAML = None
+
 logger = logging.getLogger(__name__)
 
 # Load configuration from config.yaml
 CONFIG_FILE = 'config.yaml'
+
+_yaml_rt = None
+if YAML is not None:
+    _yaml_rt = YAML()
+    _yaml_rt.preserve_quotes = True
+    _yaml_rt.width = 4096
+    _yaml_rt.indent(mapping=2, sequence=4, offset=2)
 
 
 def _get_bool(value, default=False):
@@ -32,7 +44,10 @@ def load_config():
     
     try:
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-            config = yaml.safe_load(f)
+            if _yaml_rt is not None:
+                config = _yaml_rt.load(f)
+            else:
+                config = yaml.safe_load(f)
         if config is None:
             raise ValueError(f"{CONFIG_FILE} is empty")
         return config
@@ -133,6 +148,36 @@ def get_ffmpeg_options():
 YTDL_OPTIONS = get_ytdl_options()
 FFMPEG_OPTIONS = get_ffmpeg_options()
 YT_BLACKLIST_PATTERNS = get_blacklist_patterns()
+
+def save_config():
+    """Save the current global _config to config.yaml."""
+    try:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            if _yaml_rt is not None:
+                _yaml_rt.dump(_config, f)
+            else:
+                yaml.safe_dump(_config, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save config: {e}")
+        return False
+
+
+def update_blocked_user_ids(user_ids_list):
+    """Update blocked_user_ids in the config and save."""
+    if 'permissions' not in _config:
+        _config['permissions'] = {}
+    _config['permissions']['blocked_user_ids'] = list(user_ids_list)
+    return save_config()
+
+
+def update_blacklist_patterns(patterns_list):
+    """Update blacklist_patterns in the config and save."""
+    if 'youtube' not in _config:
+        _config['youtube'] = {}
+    _config['youtube']['blacklist_patterns'] = list(patterns_list)
+    return save_config()
+
 
 # --- Permissions and Role Rules ---
 def get_permissions_config():
