@@ -1022,7 +1022,7 @@ async def remove(ctx, index: int):
 
 @bot.command()
 async def block(ctx, user_id: int = None):
-    """Adds or removes a user from the blocked list. Usage: !block <user_id>"""
+    """Adds a user to the blocked list. Usage: !block <user_id>"""
     if not await enforce_command_access(ctx, 'block'):
         return
 
@@ -1034,17 +1034,38 @@ async def block(ctx, user_id: int = None):
 
     blocked_ids = settings.get_blocked_user_ids()
     if user_id in blocked_ids:
-        blocked_ids.remove(user_id)
-        if settings.update_blocked_user_ids(blocked_ids):
-            await ctx.send(f"✅ User `{user_id}` has been **unblocked**.")
-        else:
-            await ctx.send("❌ Failed to update configuration.")
+        await ctx.send(f"ℹ️ User `{user_id}` is already blocked.")
+        return
+
+    blocked_ids.add(user_id)
+    if settings.update_blocked_user_ids(blocked_ids):
+        await ctx.send(f"✅ User `{user_id}` has been **blocked**.")
     else:
-        blocked_ids.add(user_id)
-        if settings.update_blocked_user_ids(blocked_ids):
-            await ctx.send(f"✅ User `{user_id}` has been **blocked**.")
-        else:
-            await ctx.send("❌ Failed to update configuration.")
+        await ctx.send("❌ Failed to update configuration.")
+
+
+@bot.command()
+async def unblock(ctx, user_id: int = None):
+    """Removes a user from the blocked list. Usage: !unblock <user_id>"""
+    if not await enforce_command_access(ctx, 'unblock'):
+        return
+
+    if user_id is None:
+        blocked_ids = settings.get_blocked_user_ids()
+        if not blocked_ids:
+            return await ctx.send("📝 No users are currently blocked.")
+        return await ctx.send(f"📝 **Blocked User IDs:** {', '.join(map(str, blocked_ids))}")
+
+    blocked_ids = settings.get_blocked_user_ids()
+    if user_id not in blocked_ids:
+        await ctx.send(f"ℹ️ User `{user_id}` is not currently blocked.")
+        return
+
+    blocked_ids.remove(user_id)
+    if settings.update_blocked_user_ids(blocked_ids):
+        await ctx.send(f"✅ User `{user_id}` has been **unblocked**.")
+    else:
+        await ctx.send("❌ Failed to update configuration.")
 
 
 @bot.command()
