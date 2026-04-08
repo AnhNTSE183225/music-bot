@@ -10,6 +10,7 @@ import settings
 import logging
 import importlib
 import math
+import time
 from datetime import datetime, timedelta, timezone
 
 # Configure logging
@@ -51,9 +52,10 @@ play_next_lock = asyncio.Lock()
 votes_by_guild = {}
 next_queue_id = 1
 current_song = None  # Track the currently playing song for status display
-current_song = None  # Track the currently playing song for status display
 empty_voice_leave_tasks = {}
 EMPTY_VOICE_LEAVE_DELAY_SECONDS = 10
+playback_monitor_tasks = {}
+loop_lag_monitor_task = None
 
 # Cache blacklist patterns at module level (load once on startup)
 _blacklist_patterns = []
@@ -84,6 +86,99 @@ def is_blacklisted_title(title):
         if pattern.search(title):
             return True
     return False
+
+
+def log_playback_metric(event_name, **kwargs):
+    """Emit structured playback telemetry when debug metrics are enabled."""
+    if not settings.PLAYBACK_DEBUG_METRICS:
+        return
+
+    fields = [f"event={event_name}"]
+    for key, value in kwargs.items():
+        if value is None:
+            continue
+        fields.append(f"{key}={value}")
+    logger.info("PLAYBACK_METRIC %s", " ".join(fields))
+
+
+def cancel_playback_monitor(guild_id):
+    """Cancel heartbeat monitor for one guild if active."""
+    task = playback_monitor_tasks.pop(guild_id, None)
+    if task and not task.done():
+        task.cancel()
+
+
+def start_playback_monitor(ctx, song, playback_started_perf):
+    """Start periodic playback heartbeat logs while current song is active."""
+    if not ctx.guild:
+        return
+
+    guild_id = ctx.guild.id
+    cancel_playback_monitor(guild_id)
+
+    queue_id = song.get('queue_id')
+    expected_duration_ms = None
+    if song.get('duration'):
+        expected_duration_ms = int(float(song.get('duration')) * 1000)
+
+    async def monitor():
+        try:
+            while True:
+                await asyncio.sleep(5)
+
+                voice_client = ctx.voice_client
+                if not voice_client or not voice_client.is_connected():
+                    break
+
+                active_song = current_song
+                if not active_song or active_song.get('queue_id') != queue_id:
+                    break
+
+                elapsed_ms = int((time.perf_counter() - playback_started_perf) * 1000)
+                latency_ms = int(getattr(voice_client, 'latency', 0.0) * 1000)
+                average_latency_ms = int(getattr(voice_client, 'average_latency', 0.0) * 1000)
+                state = 'playing' if voice_client.is_playing() else ('paused' if voice_client.is_paused() else 'idle')
+
+                log_playback_metric(
+                    "playback_heartbeat",
+                    guild_id=guild_id,
+                    queue_id=queue_id,
+                    source_type=song.get('type'),
+                    elapsed_ms=elapsed_ms,
+                    expected_duration_ms=expected_duration_ms,
+                    state=state,
+                    latency_ms=latency_ms,
+                    avg_latency_ms=average_latency_ms,
+                )
+        except asyncio.CancelledError:
+            return
+        except Exception as monitor_exc:
+            logger.warning("Playback monitor failed in guild %s: %s", guild_id, monitor_exc)
+        finally:
+            playback_monitor_tasks.pop(guild_id, None)
+
+    playback_monitor_tasks[guild_id] = bot.loop.create_task(monitor())
+
+
+def ensure_loop_lag_monitor():
+    """Start a lightweight event-loop lag monitor once."""
+    global loop_lag_monitor_task
+    if loop_lag_monitor_task and not loop_lag_monitor_task.done():
+        return
+
+    async def monitor_loop_lag():
+        interval = 1.0
+        threshold_ms = 200
+        expected = time.perf_counter() + interval
+        while True:
+            await asyncio.sleep(interval)
+            now = time.perf_counter()
+            lag_ms = int((now - expected) * 1000)
+            if lag_ms > threshold_ms:
+                log_playback_metric("event_loop_lag", lag_ms=lag_ms)
+            expected = now + interval
+
+    loop_lag_monitor_task = bot.loop.create_task(monitor_loop_lag())
 
 async def update_bot_status(song_title):
     """Update bot's status to show currently playing song."""
@@ -134,8 +229,16 @@ async def ensure_voice_connected(ctx):
         return False
     
     try:
-        await ctx.author.voice.channel.connect(timeout=10.0, reconnect=True)
-        await asyncio.sleep(0.5)
+        started = time.perf_counter()
+        await ctx.author.voice.channel.connect(timeout=settings.CONNECTION_TIMEOUT, reconnect=True)
+        await asyncio.sleep(settings.CONNECTION_STABILIZE_DELAY)
+        elapsed = time.perf_counter() - started
+        log_playback_metric(
+            "voice_connect_ready",
+            guild_id=getattr(ctx.guild, 'id', None),
+            elapsed_ms=int(elapsed * 1000),
+            stabilize_delay_ms=int(settings.CONNECTION_STABILIZE_DELAY * 1000),
+        )
         return True
     except Exception as e:
         logger.error(f"Failed to connect to voice channel: {e}")
@@ -154,6 +257,7 @@ def make_song(song_type, title, data, requester):
         'requester_id': requester.id,
         'requester_mention': requester.mention,
         'requester_handle': str(requester),
+        'enqueued_perf': time.perf_counter(),
     }
     next_queue_id += 1
     return song
@@ -361,34 +465,99 @@ async def play_next(ctx):
 
     song = song_queue.pop(0)
     current_song = song  # Track currently playing song
+    queue_wait_ms = int((time.perf_counter() - song.get('enqueued_perf', time.perf_counter())) * 1000)
 
     try:
         logger.debug(f"Now playing - {song['type']}: {song['title']}")
         # 1. Create the base Source
         if song['type'] == 'local':
             source_path = os.path.join(settings.MEDIA_FOLDER, song['data'])
+            source_init_start = time.perf_counter()
             source = discord.FFmpegPCMAudio(source_path)
+            source_init_ms = int((time.perf_counter() - source_init_start) * 1000)
+            log_playback_metric(
+                "source_created",
+                queue_id=song.get('queue_id'),
+                source_type='local',
+                init_ms=source_init_ms,
+                queue_wait_ms=queue_wait_ms,
+            )
         elif song['type'] == 'youtube':
             logger.debug(f"Creating FFmpeg source for YouTube: {song['data']}")
 
-            # Use discord.py's recommended approach with executor (non-blocking)
-            loop = asyncio.get_event_loop()
-            data = await loop.run_in_executor(None, lambda: ytdl.extract_info(song['data'], download=False))
+            data = None
+            cache_age_sec = None
+            cached_stream_url = song.get('stream_url')
+            cached_at = song.get('stream_url_cached_at')
+            if cached_stream_url and cached_at:
+                cache_age_sec = time.time() - float(cached_at)
+                if cache_age_sec <= settings.YT_STREAM_CACHE_TTL_SECONDS:
+                    data = {
+                        'url': cached_stream_url,
+                        'format_id': song.get('format_id'),
+                        'ext': song.get('ext'),
+                        'duration': song.get('duration'),
+                    }
+                    log_playback_metric(
+                        "yt_stream_cache_hit",
+                        queue_id=song.get('queue_id'),
+                        cache_age_ms=int(cache_age_sec * 1000),
+                    )
+
+            if data is None:
+                loop = asyncio.get_event_loop()
+                yt_extract_start = time.perf_counter()
+                data = await loop.run_in_executor(None, lambda: ytdl.extract_info(song['data'], download=False))
+                yt_extract_ms = int((time.perf_counter() - yt_extract_start) * 1000)
+                log_playback_metric(
+                    "yt_stream_extract",
+                    queue_id=song.get('queue_id'),
+                    extract_ms=yt_extract_ms,
+                    cache_age_ms=(int(cache_age_sec * 1000) if cache_age_sec is not None else None),
+                )
 
             if 'entries' in data:
                 data = data['entries'][0]
 
             filename = data['url']
+            if not filename:
+                raise ValueError("YouTube extractor returned empty stream URL")
+
+            song['stream_url'] = filename
+            song['stream_url_cached_at'] = time.time()
+            song['format_id'] = data.get('format_id')
+            song['ext'] = data.get('ext')
+            song['duration'] = data.get('duration')
+
             logger.debug(f"Stream URL obtained: {filename[:100]}...")
             logger.debug(f"Format: {data.get('format_id')}, ext: {data.get('ext')}")
 
+            source_init_start = time.perf_counter()
             source = discord.FFmpegPCMAudio(filename, **settings.FFMPEG_OPTIONS)
+            source_init_ms = int((time.perf_counter() - source_init_start) * 1000)
+            log_playback_metric(
+                "source_created",
+                queue_id=song.get('queue_id'),
+                source_type='youtube',
+                init_ms=source_init_ms,
+                queue_wait_ms=queue_wait_ms,
+                format_id=song.get('format_id'),
+                ext=song.get('ext'),
+            )
         elif song['type'] == 'url':
             logger.debug(f"Creating FFmpeg source for generic URL: {song['data']}")
+            source_init_start = time.perf_counter()
             source = discord.FFmpegPCMAudio(
                 song['data'],
-                before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-                options="-vn"
+                **settings.FFMPEG_OPTIONS,
+            )
+            source_init_ms = int((time.perf_counter() - source_init_start) * 1000)
+            log_playback_metric(
+                "source_created",
+                queue_id=song.get('queue_id'),
+                source_type='url',
+                init_ms=source_init_ms,
+                queue_wait_ms=queue_wait_ms,
             )
         else:
             raise ValueError(f"Unknown song type: {song['type']}")
@@ -404,20 +573,64 @@ async def play_next(ctx):
                 song_queue.insert(0, song)
                 return
 
+            playback_started = time.perf_counter()
+            start_playback_monitor(ctx, song, playback_started)
+
             def after_playback(error):
                 """Called after playback ends. Schedules next song with proper lock protection."""
+                elapsed_ms = int((time.perf_counter() - playback_started) * 1000)
+                drift_ms = None
+                if song.get('duration'):
+                    drift_ms = elapsed_ms - int(float(song.get('duration')) * 1000)
+                log_playback_metric(
+                    "playback_finished",
+                    queue_id=song.get('queue_id'),
+                    source_type=song.get('type'),
+                    elapsed_ms=elapsed_ms,
+                    duration_sec=song.get('duration'),
+                    drift_ms=drift_ms,
+                    error=(str(error)[:200] if error else None),
+                )
                 if error:
                     logger.error(f"Playback callback error: {error}")
+                if ctx.guild:
+                    cancel_playback_monitor(ctx.guild.id)
                 # Schedule play_next with lock to prevent race conditions
                 async def next_with_lock():
+                    lock_wait_start = time.perf_counter()
                     async with play_next_lock:
+                        lock_wait_ms = int((time.perf_counter() - lock_wait_start) * 1000)
+                        if lock_wait_ms >= 100:
+                            log_playback_metric(
+                                "play_next_lock_wait",
+                                queue_id=song.get('queue_id'),
+                                wait_ms=lock_wait_ms,
+                            )
                         if ctx.voice_client and ctx.voice_client.is_connected():
                             await play_next(ctx)
-                bot.loop.call_soon_threadsafe(lambda: bot.loop.create_task(next_with_lock()))
+
+                future = asyncio.run_coroutine_threadsafe(next_with_lock(), bot.loop)
+
+                def _on_future_done(done_future):
+                    try:
+                        done_future.result()
+                    except Exception as callback_exc:
+                        logger.error("play_next callback task failed: %s", callback_exc, exc_info=True)
+
+                future.add_done_callback(_on_future_done)
 
             if ctx.guild:
                 clear_votes(ctx.guild.id, action_key='skip')
             ctx.voice_client.play(source, after=after_playback)
+
+            log_playback_metric(
+                "playback_started",
+                queue_id=song.get('queue_id'),
+                source_type=song.get('type'),
+                queue_wait_ms=queue_wait_ms,
+                queue_size_after_pop=len(song_queue),
+                guild_id=getattr(ctx.guild, 'id', None),
+            )
             
             # Update bot's status to show currently playing song
             await update_bot_status(song['title'])
@@ -480,8 +693,16 @@ async def join(ctx):
             await ctx.voice_client.move_to(channel)
             await ctx.send(f"🔄 Moved to **{channel}**")
         else:
-            await channel.connect(timeout=10.0, reconnect=True)
-            await asyncio.sleep(0.5)
+            started = time.perf_counter()
+            await channel.connect(timeout=settings.CONNECTION_TIMEOUT, reconnect=True)
+            await asyncio.sleep(settings.CONNECTION_STABILIZE_DELAY)
+            elapsed = time.perf_counter() - started
+            log_playback_metric(
+                "voice_join_ready",
+                guild_id=getattr(ctx.guild, 'id', None),
+                elapsed_ms=int(elapsed * 1000),
+                stabilize_delay_ms=int(settings.CONNECTION_STABILIZE_DELAY * 1000),
+            )
             await ctx.send(f"👋 Joined **{channel}**")
     else:
         await ctx.send("❌ You need to be in a voice channel first.")
@@ -531,8 +752,10 @@ async def yt(ctx, *, query):
         await ctx.send(f"🔎 Searching YouTube for: **{query}**...")
 
     try:
+        yt_query_start = time.perf_counter()
         # Run blocking yt-dlp call in executor to avoid freezing the event loop
         data = await asyncio.to_thread(ytdl.extract_info, search_query, False)
+        yt_query_ms = int((time.perf_counter() - yt_query_start) * 1000)
         
         # 3. Handle Search Results vs Direct Links
         if 'entries' in data:
@@ -553,8 +776,20 @@ async def yt(ctx, *, query):
             return await ctx.send("❌ Error: Could not extract URL from video.")
         
         logger.debug(f"Using webpage URL: {webpage_url}")
+        log_playback_metric(
+            "yt_enqueue_extract",
+            query_type=('url' if search_query == query else 'search'),
+            extract_ms=yt_query_ms,
+            title=(title[:80] if title else None),
+        )
         
         song_obj = make_song('youtube', title, webpage_url, ctx.author)
+        if video_data.get('url'):
+            song_obj['stream_url'] = video_data.get('url')
+            song_obj['stream_url_cached_at'] = time.time()
+        song_obj['format_id'] = video_data.get('format_id')
+        song_obj['ext'] = video_data.get('ext')
+        song_obj['duration'] = video_data.get('duration')
         song_queue.append(song_obj)
         logger.debug(f"Added song to queue - Title: {title}")
 
@@ -717,6 +952,7 @@ async def stop(ctx):
     if ctx.guild:
         cancel_empty_voice_leave_timer(ctx.guild.id)
         clear_votes(ctx.guild.id)
+        cancel_playback_monitor(ctx.guild.id)
     if ctx.voice_client:
         ctx.voice_client.stop()
         await ctx.voice_client.disconnect()
@@ -883,6 +1119,7 @@ async def setup_hook():
     try:
         validate_command_permissions_config()
         _blacklist_patterns = load_yt_blacklist_patterns()
+        ensure_loop_lag_monitor()
         logger.info(f"Blacklist initialized with {len(_blacklist_patterns)} patterns.")
     except Exception as e:
         logger.error(f"Failed to initialize blacklist: {e}", exc_info=True)
