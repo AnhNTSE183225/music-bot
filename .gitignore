@@ -16,3 +16,4 @@ __pycache__/
 # Config files
 special.txt
 minecraft_message.txt
+*.md
