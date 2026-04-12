@@ -22,13 +22,6 @@ playback:
 youtube:
   # Regex patterns to blacklist (one per line, supports comments with #)
   blacklist_patterns:
-    # Block songs with explicit content
-    - "(?i)(explicit|clean version)"
-    # Block copyright-striked videos
-    - "(?i)(copyright|dmca|removed)"
-    # Block ads or trailers
-    - "(?i)(trailer|advertisement|promo)"
-    # Historical blocked patterns (from legacy yt_blacklist.txt)
     - "(?i)\\b9+\\s*[dđ](?:[oóòỏõọôồốổỗộơờớởỡợ])(?:[aáàảãạăằắẳẵặâầấẩẫậ])\\s*(?:h(?:[oóòỏõọôồốổỗộơờớởỡợ])(?:[aáàảãạăằắẳẵặâầấẩẫậ])\\s+)?h(?:[oóòỏõọôồốổỗộơờớởỡợ])ng\\b"
     - "(?i)\\brap\\s*vi(?:e|ệ)t\\b"
     - "(?i)\\bcover\\b"
@@ -87,6 +80,9 @@ permissions:
       mode: "open"
 
     queue:
+      mode: "open"
+
+    current:
       mode: "open"
 
     skip:
