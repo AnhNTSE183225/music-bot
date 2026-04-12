@@ -903,6 +903,19 @@ async def queue(ctx):
     else:
         await ctx.send(queue_list)
 
+
+@bot.command()
+async def current(ctx):
+    """Shows the currently playing song."""
+    if not current_song:
+        await ctx.send("❌ No song is currently playing.")
+        return
+
+    await ctx.send(
+        f"🎶 **Current Song:** {current_song['title']} "
+        f"(requested by {current_song.get('requester_mention', 'unknown')})"
+    )
+
 @bot.command()
 async def skipto(ctx, index: int):
     """Skips to a specific number in the queue. Usage: !skipto <position>"""
