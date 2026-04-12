@@ -2,12 +2,16 @@ import os
 import yaml
 import logging
 
+from dotenv import load_dotenv
+
 try:
     from ruamel.yaml import YAML
 except ImportError:
     YAML = None
 
 logger = logging.getLogger(__name__)
+
+load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 
 # Load configuration from config.yaml
 CONFIG_FILE = 'config.yaml'
@@ -148,6 +152,16 @@ def get_ffmpeg_options():
 YTDL_OPTIONS = get_ytdl_options()
 FFMPEG_OPTIONS = get_ffmpeg_options()
 YT_BLACKLIST_PATTERNS = get_blacklist_patterns()
+
+# --- Web API Settings ---
+_web_cfg = _config.get('web_api', {}) or {}
+WEB_API_ENABLED = _get_bool(_web_cfg.get('enabled', True), True)
+WEB_API_HOST = str(os.getenv('MUSICBOT_WEB_API_HOST', _web_cfg.get('host', '127.0.0.1')))
+WEB_API_PORT = int(os.getenv('MUSICBOT_WEB_API_PORT', _web_cfg.get('port', 8080)))
+WEB_API_ALLOWED_ORIGINS = list(_web_cfg.get('allowed_origins', ['http://localhost:5173']))
+WEB_ADMIN_USERNAME = str(os.getenv('MUSICBOT_WEB_ADMIN_USERNAME', '')).strip()
+WEB_ADMIN_PASSWORD = str(os.getenv('MUSICBOT_WEB_ADMIN_PASSWORD', '')).strip()
+WEB_ADMIN_TOKEN_TTL_SECONDS = int(os.getenv('MUSICBOT_WEB_ADMIN_TOKEN_TTL_SECONDS', 86400))
 
 def save_config():
     """Save the current global _config to config.yaml."""

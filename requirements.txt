@@ -10,3 +10,6 @@ python-dotenv
 # YAML configuration parsing
 PyYAML
 ruamel.yaml
+
+# Web API for frontend integration
+aiohttp

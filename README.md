@@ -11,7 +11,7 @@ A Discord music bot built with discord.py and yt-dlp.
 
 Simply run:
 ```powershell
-.\run.ps1
+.\start.ps1
 ```
 
 The script automatically handles everything:
@@ -44,8 +44,35 @@ To add or upgrade packages:
 1. Activate venv: `.\venv\Scripts\Activate.ps1`
 2. Install/upgrade: `pip install --upgrade package_name`
 3. Freeze to requirements.txt: `pip freeze > requirements.txt`
-4. Next time you run `.\run.ps1`, dependencies will auto-update
+4. Next time you run `.\start.ps1`, dependencies will auto-update
 5. Commit the updated `requirements.txt` to git
 
-# Prompt used
-You are a senior developer, you are obsessed with DRY principle and clean code
+## Web API For Frontend
+
+MusicBot exposes an HTTP API for the `music-bot-fe` dashboard.
+
+- Base URL: `http://127.0.0.1:8080/api`
+- Endpoints:
+	- `GET /state`
+	- `POST /volume`
+	- `POST /skip-vote`
+	- `GET /youtube/search?q=...`
+	- `POST /queue/youtube`
+
+Configure in `config.yaml`:
+
+	Admin login uses credentials from `.env`:
+
+	- `MUSICBOT_WEB_ADMIN_USERNAME`
+	- `MUSICBOT_WEB_ADMIN_PASSWORD`
+	- `MUSICBOT_WEB_ADMIN_TOKEN_TTL_SECONDS` optionally controls session length
+
+```yaml
+web_api:
+	enabled: true
+	host: "127.0.0.1"
+	port: 8080
+	allowed_origins:
+		- "http://localhost:5173"
+```
+

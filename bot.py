@@ -11,7 +11,9 @@ import logging
 import importlib
 import math
 import time
+import secrets
 from datetime import datetime, timedelta, timezone
+from aiohttp import web
 
 # Configure logging
 logging.basicConfig(
@@ -52,10 +54,14 @@ play_next_lock = asyncio.Lock()
 votes_by_guild = {}
 next_queue_id = 1
 current_song = None  # Track the currently playing song for status display
+current_song_started_perf = None
 empty_voice_leave_tasks = {}
 EMPTY_VOICE_LEAVE_DELAY_SECONDS = 10
 playback_monitor_tasks = {}
 loop_lag_monitor_task = None
+web_api_runner = None
+web_api_site = None
+admin_sessions = {}
 
 # Cache blacklist patterns at module level (load once on startup)
 _blacklist_patterns = []
@@ -219,6 +225,551 @@ def find_best_match(query):
     close_matches = difflib.get_close_matches(query, files, n=1, cutoff=0.5)
     return close_matches[0] if close_matches else None
 
+
+def build_song_payload(song):
+    """Convert an internal song object into API-safe JSON payload."""
+    if not song:
+        return None
+
+    thumbnail_url = song.get('thumbnail') or song.get('thumbnail_url')
+    if not thumbnail_url and song.get('webpage_url'):
+        thumbnail_url = f"https://img.youtube.com/vi/{song.get('webpage_url').split('v=')[-1].split('&')[0]}/hqdefault.jpg"
+
+    return {
+        'id': str(song.get('queue_id', '')),
+        'title': song.get('title', 'Unknown track'),
+        'artist': song.get('uploader', 'YouTube') if song.get('type') == 'youtube' else 'Local file',
+        'durationSec': int(song.get('duration') or 0),
+        'thumbnailUrl': thumbnail_url or '',
+        'requestedBy': song.get('requester_handle', 'unknown'),
+        'sourceUrl': song.get('webpage_url') or song.get('data') or '',
+    }
+
+
+def get_primary_voice_client():
+    """Return the first connected voice client, if any."""
+    for voice_client in bot.voice_clients:
+        if voice_client and voice_client.is_connected():
+            return voice_client
+    return None
+
+
+class WebPlaybackContext:
+    """Minimal playback context for API-triggered queue operations."""
+
+    def __init__(self, voice_client):
+        self.voice_client = voice_client
+        self.guild = getattr(voice_client, 'guild', None)
+
+    async def send(self, _message):
+        # API calls should not post bot messages in text channels.
+        return
+
+
+def get_vote_required_for_voice_client(voice_client):
+    """Compute skip votes required using current config and live listeners."""
+    vote_cfg = settings.get_skip_vote_config()
+    same_channel_only = vote_cfg.get('same_channel_only', True)
+
+    if not voice_client or not voice_client.guild:
+        return 1, 0
+
+    if same_channel_only:
+        eligible_members = [m for m in voice_client.channel.members if not m.bot] if voice_client.channel else []
+    else:
+        eligible_members = [
+            m for m in voice_client.guild.members if (not m.bot and m.voice and m.voice.channel)
+        ]
+
+    member_count = len(eligible_members)
+    if member_count == 0:
+        return 1, 0
+
+    threshold_type = str(vote_cfg.get('threshold_type', 'ratio')).lower()
+    threshold_value = vote_cfg.get('threshold_value', 0.5)
+    min_votes = max(1, int(vote_cfg.get('min_votes', 1)))
+
+    if threshold_type == 'absolute':
+        base_required = max(1, int(threshold_value))
+    else:
+        base_required = math.ceil(member_count * float(threshold_value))
+
+    required = max(min_votes, base_required)
+    required = min(required, member_count)
+    return required, member_count
+
+
+async def extract_youtube_video_data(query):
+    """Resolve a user query/url to a single YouTube video data object."""
+    if query.startswith(("http://", "https://", "www.")):
+        search_query = query
+    else:
+        search_query = f"ytsearch:{query}"
+
+    data = await asyncio.to_thread(ytdl.extract_info, search_query, False)
+    if not data:
+        raise RuntimeError("No data returned from YouTube lookup")
+
+    if 'entries' in data:
+        entries = data.get('entries') or []
+        if not entries:
+            raise RuntimeError("No results found")
+        return entries[0]
+
+    return data
+
+
+def make_web_song(video_data, requester_label):
+    """Create a queue entry compatible with existing playback pipeline from web input."""
+    global next_queue_id
+
+    webpage_url = video_data.get('webpage_url') or video_data.get('url')
+    title = video_data.get('title') or 'Untitled YouTube Track'
+
+    song = {
+        'queue_id': next_queue_id,
+        'type': 'youtube',
+        'title': title,
+        'data': webpage_url,
+        'requester_id': 0,
+        'requester_mention': requester_label,
+        'requester_handle': requester_label,
+        'enqueued_perf': time.perf_counter(),
+        'stream_url': video_data.get('url'),
+        'stream_url_cached_at': time.time() if video_data.get('url') else None,
+        'format_id': video_data.get('format_id'),
+        'ext': video_data.get('ext'),
+        'duration': video_data.get('duration'),
+        'uploader': video_data.get('uploader') or video_data.get('channel'),
+        'thumbnail': video_data.get('thumbnail'),
+        'webpage_url': webpage_url,
+    }
+    next_queue_id += 1
+    return song
+
+
+def build_api_snapshot():
+    """Build a frontend snapshot from live bot state."""
+    voice_client = get_primary_voice_client()
+    listeners = get_non_bot_voice_member_count(voice_client)
+    required_votes, _ = get_vote_required_for_voice_client(voice_client)
+    guild_id = voice_client.guild.id if voice_client and voice_client.guild else 0
+    guild_votes = votes_by_guild.get(guild_id, {}) if guild_id else {}
+    skip_votes = len(guild_votes.get('skip', set()))
+
+    elapsed_sec = 0
+    if current_song_started_perf is not None:
+        elapsed_sec = max(0, int(time.perf_counter() - current_song_started_perf))
+
+    now_payload = build_song_payload(current_song)
+    if now_payload is None:
+        now_payload = {
+            'id': 'none',
+            'title': 'No song is playing',
+            'artist': 'MusicBot',
+            'durationSec': 0,
+            'thumbnailUrl': '',
+            'requestedBy': 'system',
+            'sourceUrl': '',
+        }
+
+    return {
+        'roomId': str(guild_id or 'offline'),
+        'listeners': listeners,
+        'volume': int(current_volume * 100),
+        'voteSkip': {
+            'count': skip_votes,
+            'threshold': required_votes,
+        },
+        'nowPlaying': {
+            'track': now_payload,
+            'elapsedSec': elapsed_sec,
+        },
+        'queue': [build_song_payload(song) for song in song_queue],
+        'isConnected': bool(voice_client and voice_client.is_connected()),
+    }
+
+
+def build_cors_headers(request):
+    """Build CORS headers for allowed frontend origins."""
+    origin = request.headers.get('Origin')
+    if origin in settings.WEB_API_ALLOWED_ORIGINS:
+        return {
+            'Access-Control-Allow-Origin': origin,
+            'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type',
+        }
+    return {}
+
+
+def json_with_cors(request, payload, status=200):
+    headers = build_cors_headers(request)
+    return web.json_response(payload, status=status, headers=headers)
+
+
+def _extract_bearer_token(request):
+    authorization = request.headers.get('Authorization', '')
+    if authorization.startswith('Bearer '):
+        return authorization.removeprefix('Bearer ').strip()
+    return request.headers.get('X-MusicBot-Admin-Token', '').strip()
+
+
+def _get_admin_session(request):
+    token = _extract_bearer_token(request)
+    if not token:
+        return None
+
+    session = admin_sessions.get(token)
+    if not session:
+        return None
+
+    if session['expires_at'] < time.time():
+        admin_sessions.pop(token, None)
+        return None
+
+    return session
+
+
+def _require_admin(request):
+    session = _get_admin_session(request)
+    if not session:
+        return None, json_with_cors(request, {'error': 'Admin login required'}, status=401)
+    return session, None
+
+
+def _issue_admin_token(username):
+    token = secrets.token_urlsafe(32)
+    admin_sessions[token] = {
+        'username': username,
+        'expires_at': time.time() + settings.WEB_ADMIN_TOKEN_TTL_SECONDS,
+    }
+    return token
+
+
+async def api_login(request):
+    body = await request.json()
+    username = str(body.get('username') or '').strip()
+    password = str(body.get('password') or '').strip()
+
+    if not settings.WEB_ADMIN_USERNAME or not settings.WEB_ADMIN_PASSWORD:
+        return json_with_cors(request, {'error': 'Web admin credentials are not configured'}, status=500)
+
+    if username != settings.WEB_ADMIN_USERNAME or password != settings.WEB_ADMIN_PASSWORD:
+        return json_with_cors(request, {'error': 'Invalid username or password'}, status=401)
+
+    token = _issue_admin_token(username)
+    return json_with_cors(
+        request,
+        {
+            'token': token,
+            'user': {
+                'username': username,
+                'role': 'admin',
+            },
+        },
+    )
+
+
+async def api_session(request):
+    session = _get_admin_session(request)
+    if not session:
+        return json_with_cors(request, {'authenticated': False, 'user': None})
+
+    return json_with_cors(
+        request,
+        {
+            'authenticated': True,
+            'user': {
+                'username': session['username'],
+                'role': 'admin',
+            },
+        },
+    )
+
+
+async def api_logout(request):
+    token = _extract_bearer_token(request)
+    if token:
+        admin_sessions.pop(token, None)
+    return json_with_cors(request, {'loggedOut': True})
+
+
+async def api_options(request):
+    return web.Response(status=204, headers=build_cors_headers(request))
+
+
+async def api_get_state(request):
+    return json_with_cors(request, build_api_snapshot())
+
+
+async def api_set_volume(request):
+    global current_volume
+
+    session, response = _require_admin(request)
+    if response:
+        return response
+
+    body = await request.json()
+    volume = int(body.get('volume', -1))
+    if volume < 0 or volume > 100:
+        return json_with_cors(request, {'error': 'Volume must be between 0 and 100'}, status=400)
+
+    current_volume = volume / 100
+    voice_client = get_primary_voice_client()
+    if voice_client and voice_client.source:
+        voice_client.source.volume = current_volume
+
+    return json_with_cors(request, {'snapshot': build_api_snapshot(), 'user': session['username']})
+
+
+async def api_vote_skip(request):
+    body = await request.json()
+    voter_id = str(body.get('voterId') or '').strip()
+    if not voter_id:
+        return json_with_cors(request, {'error': 'voterId is required'}, status=400)
+
+    voice_client = get_primary_voice_client()
+    if not voice_client or not voice_client.is_playing():
+        return json_with_cors(request, {'error': 'Nothing is playing'}, status=400)
+
+    guild_id = voice_client.guild.id
+    votes, already_voted = register_vote(guild_id, 'skip', voter_id)
+    required_votes, eligible_count = get_vote_required_for_voice_client(voice_client)
+
+    if already_voted:
+        return json_with_cors(
+            request,
+            {
+                'alreadyVoted': True,
+                'count': len(votes),
+                'threshold': required_votes,
+                'eligible': eligible_count,
+                'snapshot': build_api_snapshot(),
+            },
+        )
+
+    skipped = False
+    if len(votes) >= required_votes:
+        clear_votes(guild_id, action_key='skip')
+        voice_client.stop()
+        skipped = True
+
+    return json_with_cors(
+        request,
+        {
+            'alreadyVoted': False,
+            'count': len(votes),
+            'threshold': required_votes,
+            'eligible': eligible_count,
+            'skipped': skipped,
+            'snapshot': build_api_snapshot(),
+        },
+    )
+
+
+async def api_search_youtube(request):
+    query = (request.query.get('q') or '').strip()
+    if not query:
+        return json_with_cors(request, {'results': []})
+
+    search_query = f"ytsearch8:{query}"
+    data = await asyncio.to_thread(ytdl.extract_info, search_query, False)
+    entries = (data or {}).get('entries') or []
+
+    results = []
+    for entry in entries:
+        webpage_url = entry.get('webpage_url') or entry.get('url')
+        if not webpage_url:
+            continue
+        results.append(
+            {
+                'title': entry.get('title') or 'Untitled',
+                'url': webpage_url,
+                'durationSec': int(entry.get('duration') or 0),
+                'thumbnailUrl': entry.get('thumbnail') or '',
+                'channel': entry.get('uploader') or entry.get('channel') or 'YouTube',
+            }
+        )
+
+    return json_with_cors(request, {'results': results})
+
+
+async def api_add_youtube_to_queue(request):
+    body = await request.json()
+    query = str(body.get('query') or '').strip()
+    requester = str(body.get('requester') or 'Web User').strip()
+    if not query:
+        return json_with_cors(request, {'error': 'query is required'}, status=400)
+
+    try:
+        video_data = await extract_youtube_video_data(query)
+    except Exception as e:
+        return json_with_cors(request, {'error': f'Failed to resolve YouTube query: {e}'}, status=400)
+
+    title = video_data.get('title') or ''
+    if is_blacklisted_title(title):
+        return json_with_cors(request, {'error': 'This song is in the blacklist'}, status=400)
+
+    song = make_web_song(video_data, requester)
+    song_queue.append(song)
+
+    voice_client = get_primary_voice_client()
+    if voice_client and voice_client.is_connected() and not voice_client.is_playing() and not voice_client.is_paused():
+        async with play_next_lock:
+            await play_next(WebPlaybackContext(voice_client))
+
+    return json_with_cors(request, {'queued': True, 'song': build_song_payload(song), 'snapshot': build_api_snapshot()})
+
+
+async def api_admin_set_volume(request):
+    global current_volume
+
+    session, response = _require_admin(request)
+    if response:
+        return response
+
+    body = await request.json()
+    volume = int(body.get('volume', -1))
+    if volume < 0 or volume > 100:
+        return json_with_cors(request, {'error': 'Volume must be between 0 and 100'}, status=400)
+
+    current_volume = volume / 100
+    voice_client = get_primary_voice_client()
+    if voice_client and voice_client.source:
+        voice_client.source.volume = current_volume
+
+    return json_with_cors(request, {'snapshot': build_api_snapshot(), 'user': session['username']})
+
+
+async def api_admin_clear(request):
+    session, response = _require_admin(request)
+    if response:
+        return response
+
+    voice_client = get_primary_voice_client()
+    if voice_client and voice_client.is_connected():
+        clear_votes(voice_client.guild.id)
+
+    song_queue.clear()
+    return json_with_cors(request, {'snapshot': build_api_snapshot(), 'user': session['username']})
+
+
+async def api_admin_skip(request):
+    session, response = _require_admin(request)
+    if response:
+        return response
+
+    voice_client = get_primary_voice_client()
+    if not voice_client or not voice_client.is_playing():
+        return json_with_cors(request, {'error': 'Nothing is playing'}, status=400)
+
+    if voice_client.guild:
+        clear_votes(voice_client.guild.id, action_key='skip')
+    voice_client.stop()
+    return json_with_cors(request, {'snapshot': build_api_snapshot(), 'user': session['username']})
+
+
+async def api_admin_stop(request):
+    session, response = _require_admin(request)
+    if response:
+        return response
+
+    voice_client = get_primary_voice_client()
+    if voice_client and voice_client.guild:
+        cancel_empty_voice_leave_timer(voice_client.guild.id)
+        clear_votes(voice_client.guild.id)
+        cancel_playback_monitor(voice_client.guild.id)
+
+    global current_song, current_song_started_perf
+    current_song = None
+    current_song_started_perf = None
+    song_queue.clear()
+
+    if voice_client:
+        voice_client.stop()
+        await voice_client.disconnect()
+        await clear_bot_status()
+
+    return json_with_cors(request, {'snapshot': build_api_snapshot(), 'user': session['username']})
+
+
+async def api_admin_skipto(request):
+    session, response = _require_admin(request)
+    if response:
+        return response
+
+    body = await request.json()
+    index = int(body.get('index', 0))
+    voice_client = get_primary_voice_client()
+
+    if not voice_client or not voice_client.is_playing():
+        return json_with_cors(request, {'error': 'Nothing is playing'}, status=400)
+
+    if index < 1 or index > len(song_queue):
+        return json_with_cors(request, {'error': f'Invalid position. Choose between 1 and {len(song_queue)}.'}, status=400)
+
+    song_queue[:] = song_queue[index - 1:]
+    voice_client.stop()
+    return json_with_cors(request, {'snapshot': build_api_snapshot(), 'user': session['username']})
+
+
+async def api_admin_remove(request):
+    session, response = _require_admin(request)
+    if response:
+        return response
+
+    body = await request.json()
+    index = int(body.get('index', 0))
+
+    if index < 1 or index > len(song_queue):
+        return json_with_cors(request, {'error': f'Invalid position. Choose between 1 and {len(song_queue)}.'}, status=400)
+
+    removed_song = song_queue.pop(index - 1)
+    if request.app:
+        voice_client = get_primary_voice_client()
+        if voice_client and voice_client.guild:
+            clear_votes(voice_client.guild.id, action_key=f"remove:{removed_song['queue_id']}")
+
+    return json_with_cors(request, {'removed': True, 'snapshot': build_api_snapshot(), 'user': session['username']})
+
+
+async def start_web_api():
+    """Start the HTTP API server for frontend integration."""
+    global web_api_runner, web_api_site
+    if not settings.WEB_API_ENABLED:
+        logger.info("Web API disabled by config.")
+        return
+
+    if web_api_runner is not None:
+        return
+
+    app = web.Application()
+    app.add_routes(
+        [
+            web.post('/api/auth/login', api_login),
+            web.get('/api/auth/session', api_session),
+            web.post('/api/auth/logout', api_logout),
+            web.get('/api/state', api_get_state),
+            web.post('/api/volume', api_set_volume),
+            web.post('/api/skip-vote', api_vote_skip),
+            web.get('/api/youtube/search', api_search_youtube),
+            web.post('/api/queue/youtube', api_add_youtube_to_queue),
+            web.post('/api/admin/volume', api_admin_set_volume),
+            web.post('/api/admin/clear', api_admin_clear),
+            web.post('/api/admin/skip', api_admin_skip),
+            web.post('/api/admin/stop', api_admin_stop),
+            web.post('/api/admin/skipto', api_admin_skipto),
+            web.post('/api/admin/remove', api_admin_remove),
+            web.options('/api/{tail:.*}', api_options),
+        ]
+    )
+
+    web_api_runner = web.AppRunner(app)
+    await web_api_runner.setup()
+    web_api_site = web.TCPSite(web_api_runner, settings.WEB_API_HOST, settings.WEB_API_PORT)
+    await web_api_site.start()
+    logger.info("Web API started at http://%s:%s", settings.WEB_API_HOST, settings.WEB_API_PORT)
+
 async def ensure_voice_connected(ctx):
     """Ensure bot is connected to user's voice channel. Returns True on success."""
     if ctx.voice_client and ctx.voice_client.is_connected():
@@ -347,7 +898,7 @@ def ensure_empty_voice_leave_timer(guild):
         return
 
     async def leave_if_still_empty():
-        global current_song
+        global current_song, current_song_started_perf
         try:
             await asyncio.sleep(EMPTY_VOICE_LEAVE_DELAY_SECONDS)
             fresh_voice_client = guild.voice_client
@@ -357,6 +908,7 @@ def ensure_empty_voice_leave_timer(guild):
                 return
 
             current_song = None
+            current_song_started_perf = None
             song_queue.clear()
             clear_votes(guild_id)
             fresh_voice_client.stop()
@@ -447,7 +999,7 @@ def validate_command_permissions_config():
 
 async def play_next(ctx):
     """Plays the next item in the queue with volume control. Must be called within play_next_lock."""
-    global current_song
+    global current_song, current_song_started_perf
 
     # Check if voice client exists and is connected
     if not ctx.voice_client or not ctx.voice_client.is_connected():
@@ -460,6 +1012,7 @@ async def play_next(ctx):
 
     if not song_queue:
         current_song = None
+        current_song_started_perf = None
         await clear_bot_status()
         return
 
@@ -574,6 +1127,7 @@ async def play_next(ctx):
                 return
 
             playback_started = time.perf_counter()
+            current_song_started_perf = playback_started
             start_playback_monitor(ctx, song, playback_started)
 
             def after_playback(error):
@@ -790,6 +1344,9 @@ async def yt(ctx, *, query):
         song_obj['format_id'] = video_data.get('format_id')
         song_obj['ext'] = video_data.get('ext')
         song_obj['duration'] = video_data.get('duration')
+        song_obj['uploader'] = video_data.get('uploader') or video_data.get('channel')
+        song_obj['thumbnail'] = video_data.get('thumbnail')
+        song_obj['webpage_url'] = webpage_url
         song_queue.append(song_obj)
         logger.debug(f"Added song to queue - Title: {title}")
 
@@ -959,8 +1516,9 @@ async def stop(ctx):
     if not await enforce_command_access(ctx, 'stop'):
         return
 
-    global current_song
+    global current_song, current_song_started_perf
     current_song = None
+    current_song_started_perf = None
     song_queue.clear()
     if ctx.guild:
         cancel_empty_voice_leave_timer(ctx.guild.id)
@@ -1154,6 +1712,7 @@ async def setup_hook():
         validate_command_permissions_config()
         _blacklist_patterns = load_yt_blacklist_patterns()
         ensure_loop_lag_monitor()
+        await start_web_api()
         logger.info(f"Blacklist initialized with {len(_blacklist_patterns)} patterns.")
     except Exception as e:
         logger.error(f"Failed to initialize blacklist: {e}", exc_info=True)
