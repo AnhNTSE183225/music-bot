@@ -62,9 +62,10 @@ ffmpeg:
 web_api:
   enabled: true
   host: "127.0.0.1"
-  port: 8080
+  port: 8081
   allowed_origins:
     - "http://localhost:5173"
+    - "https://anhntse183225.github.io"
 
 # Command Permissions (2 roles: admin and non-admin)
 permissions:
