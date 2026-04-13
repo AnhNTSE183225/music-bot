@@ -1,0 +1,16 @@
+# Redirect www to apex domain.
+www.theanh0804.id.vn {
+    redir https://theanh0804.id.vn{uri} permanent
+}
+
+# Public HTTPS API endpoint for MusicBot.
+theanh0804.id.vn {
+    handle /api/* {
+        reverse_proxy 127.0.0.1:8081
+    }
+
+    # Do not expose other routes on this domain from the API server.
+    handle {
+        respond "Not Found" 404
+    }
+}

@@ -51,13 +51,31 @@ To add or upgrade packages:
 
 MusicBot exposes an HTTP API for the `music-bot-fe` dashboard.
 
-- Base URL: `http://127.0.0.1:8080/api`
+- Base URL: `http://<server-ip>:8081/api`
 - Endpoints:
 	- `GET /state`
 	- `POST /volume`
 	- `POST /skip-vote`
 	- `GET /youtube/search?q=...`
 	- `POST /queue/youtube`
+
+Quick check from another machine in the same LAN:
+	- Open `http://<server-ip>:8081/api/state`
+
+If this does not load, verify `web_api.host` is `0.0.0.0` in `config.yaml` and firewall allows inbound TCP `8081`.
+
+### HTTPS for GitHub Pages frontend
+
+If your frontend is on GitHub Pages (`https://...github.io/...`), browser requests to `http://` API will be blocked as mixed content.
+
+Use HTTPS in front of MusicBot API with a reverse proxy.
+
+- Caddy config template: `deploy/Caddyfile`
+- Proxy target: `127.0.0.1:8081`
+
+After HTTPS is working:
+	- Set repository secret `MUSIC_API_BASE_URL` to `https://<your-domain>/api`
+	- Manually rerun the GitHub Pages workflow to redeploy frontend with new API URL
 
 Configure in `config.yaml`:
 
