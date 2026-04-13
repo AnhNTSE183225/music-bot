@@ -18,7 +18,11 @@ The script automatically handles everything:
 - Creates a Python virtual environment (`venv/`) if needed
 - Activates the environment
 - Installs dependencies from `requirements.txt` (on first run and when requirements change)
+- Starts Caddy (if available) using `deploy/Caddyfile`
 - Runs the bot
+
+Optional:
+- Set `MUSICBOT_CADDY_PATH` if `caddy` is not in PATH.
 
 That's it—no separate setup required! ✨
 
