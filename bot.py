@@ -394,10 +394,20 @@ def build_cors_headers(request):
     """Build CORS headers for allowed frontend origins."""
     origin = request.headers.get('Origin')
     if origin in settings.WEB_API_ALLOWED_ORIGINS:
+        requested_headers = request.headers.get('Access-Control-Request-Headers', '')
+        allow_headers = {'Content-Type', 'Authorization', 'X-MusicBot-Admin-Token'}
+        if requested_headers:
+            for header in requested_headers.split(','):
+                name = header.strip()
+                if name:
+                    allow_headers.add(name)
+
         return {
             'Access-Control-Allow-Origin': origin,
             'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-MusicBot-Admin-Token',
+            'Access-Control-Allow-Headers': ', '.join(sorted(allow_headers, key=str.lower)),
+            'Access-Control-Max-Age': '600',
+            'Vary': 'Origin, Access-Control-Request-Headers',
         }
     return {}
 
