@@ -63,6 +63,9 @@ ffmpeg:
 permissions:
   # Blocked users cannot run any bot command.
   blocked_user_ids: []
+  # When null or empty, access mode is "everyone except blocked".
+  # When this list has IDs, access mode is "only whitelisted users".
+  allowed_user_ids: null
   commands:
     # open: anyone can run
     # admin_only: only users with Discord Administrator permission can run
@@ -116,6 +119,12 @@ permissions:
       mode: "admin_only"
 
     unblock:
+      mode: "admin_only"
+
+    whitelist:
+      mode: "admin_only"
+
+    unwhitelist:
       mode: "admin_only"
 
     blacklist:

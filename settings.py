@@ -171,6 +171,24 @@ def update_blocked_user_ids(user_ids_list):
     return save_config()
 
 
+def update_allowed_user_ids(user_ids_list_or_none):
+    """Update allowed_user_ids in the config and save.
+
+    Accepts:
+      - None: disable whitelist mode
+      - Iterable: explicit whitelist values
+    """
+    if 'permissions' not in _config:
+        _config['permissions'] = {}
+
+    if user_ids_list_or_none is None:
+        _config['permissions']['allowed_user_ids'] = None
+    else:
+        _config['permissions']['allowed_user_ids'] = list(user_ids_list_or_none)
+
+    return save_config()
+
+
 def update_blacklist_patterns(patterns_list):
     """Update blacklist_patterns in the config and save."""
     if 'youtube' not in _config:
@@ -183,6 +201,21 @@ def update_blacklist_patterns(patterns_list):
 def get_permissions_config():
     """Get permissions configuration from config."""
     return _config.get('permissions', {}) or {}
+
+
+def validate_permissions_identity_lists():
+    """Fail fast if allow/block user list config has invalid types."""
+    permissions_cfg = get_permissions_config()
+
+    blocked_raw = permissions_cfg.get('blocked_user_ids', [])
+    if blocked_raw is None:
+        blocked_raw = []
+    if not isinstance(blocked_raw, list):
+        raise ValueError("permissions.blocked_user_ids must be a list")
+
+    allowed_raw = permissions_cfg.get('allowed_user_ids', None)
+    if allowed_raw is not None and not isinstance(allowed_raw, list):
+        raise ValueError("permissions.allowed_user_ids must be null or a list")
 
 
 def get_blocked_user_ids():
@@ -198,6 +231,35 @@ def get_blocked_user_ids():
             logger.warning("Ignoring invalid blocked_user_ids entry: %r", raw_id)
 
     return blocked_ids
+
+
+def get_allowed_user_ids():
+    """Get allowed user IDs from config.
+
+    Returns:
+      - None: whitelist disabled
+      - set[int]: whitelist entries (may be empty)
+    """
+    permissions_cfg = get_permissions_config()
+    raw_ids = permissions_cfg.get('allowed_user_ids', None)
+
+    if raw_ids is None:
+        return None
+
+    allowed_ids = set()
+    for raw_id in raw_ids:
+        try:
+            allowed_ids.add(int(raw_id))
+        except (TypeError, ValueError):
+            logger.warning("Ignoring invalid allowed_user_ids entry: %r", raw_id)
+
+    return allowed_ids
+
+
+def is_whitelist_enabled():
+    """Return True only when whitelist has at least one explicit user ID."""
+    allowed_ids = get_allowed_user_ids()
+    return bool(allowed_ids)
 
 
 def get_command_permission_mode(command_name):
@@ -220,3 +282,6 @@ def get_skip_vote_config():
         'same_channel_only': vote_cfg.get('same_channel_only', True),
         'force_vote_for_admin': vote_cfg.get('force_vote_for_admin', False),
     }
+
+
+validate_permissions_identity_lists()
