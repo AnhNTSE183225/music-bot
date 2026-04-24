@@ -854,11 +854,30 @@ class BlockedUserError(commands.CheckFailure):
     """Raised when a blocked user attempts to run a command."""
 
 
+class WhitelistOnlyError(commands.CheckFailure):
+    """Raised when whitelist mode is enabled and user is not in whitelist."""
+
+
 @bot.check
-def enforce_blocked_users(ctx):
-    """Prevent blocked users from running any command."""
-    if ctx.author and ctx.author.id in settings.get_blocked_user_ids():
+def enforce_user_access(ctx):
+    """Enforce global access policy.
+
+    Rules:
+      - If whitelist has entries, only those users are allowed.
+      - Otherwise, allow everyone except blocked users.
+    """
+    if not ctx.author:
+        return True
+
+    allowed_ids = settings.get_allowed_user_ids()
+    if allowed_ids:
+        if ctx.author.id not in allowed_ids:
+            raise WhitelistOnlyError(f"User {ctx.author.id} is not in whitelist")
+        return True
+
+    if ctx.author.id in settings.get_blocked_user_ids():
         raise BlockedUserError(f"User {ctx.author.id} is blocked")
+
     return True
 
 
@@ -1231,6 +1250,9 @@ async def on_command_error(ctx, error):
     elif isinstance(error, BlockedUserError):
         await ctx.send("❌ You are blocked from using this bot.")
         logger.info("Blocked user %s attempted command '%s'", ctx.author.id, ctx.message.content)
+    elif isinstance(error, WhitelistOnlyError):
+        await ctx.send("❌ You are not allowed to use this bot.")
+        logger.info("Non-whitelisted user %s attempted command '%s'", ctx.author.id, ctx.message.content)
     elif isinstance(error, commands.MissingPermissions):
         await ctx.send("❌ You don't have permission to use this command.")
     elif isinstance(error, commands.BadArgument):
@@ -1645,6 +1667,67 @@ async def unblock(ctx, user_id: int = None):
     blocked_ids.remove(user_id)
     if settings.update_blocked_user_ids(blocked_ids):
         await ctx.send(f"✅ User `{user_id}` has been **unblocked**.")
+    else:
+        await ctx.send("❌ Failed to update configuration.")
+
+
+@bot.command()
+async def whitelist(ctx, user_id: int = None):
+    """Lists whitelist status or adds a user to whitelist. Usage: !whitelist [user_id]"""
+    if not await enforce_command_access(ctx, 'whitelist'):
+        return
+
+    allowed_ids = settings.get_allowed_user_ids()
+
+    if user_id is None:
+        if not allowed_ids:
+            return await ctx.send("📝 Whitelist is disabled (mode: everyone except blocked users).")
+        return await ctx.send(f"📝 **Whitelisted User IDs:** {', '.join(map(str, sorted(allowed_ids)))}")
+
+    if allowed_ids is None:
+        allowed_ids = set()
+
+    if user_id in allowed_ids:
+        await ctx.send(f"ℹ️ User `{user_id}` is already whitelisted.")
+        return
+
+    allowed_ids.add(user_id)
+    if settings.update_allowed_user_ids(sorted(allowed_ids)):
+        await ctx.send(f"✅ User `{user_id}` has been **whitelisted**.")
+    else:
+        await ctx.send("❌ Failed to update configuration.")
+
+
+@bot.command()
+async def unwhitelist(ctx, user_id: int = None):
+    """Removes a user from whitelist or disables whitelist mode. Usage: !unwhitelist [user_id]"""
+    if not await enforce_command_access(ctx, 'unwhitelist'):
+        return
+
+    allowed_ids = settings.get_allowed_user_ids()
+    if not allowed_ids:
+        return await ctx.send("📝 Whitelist is already disabled.")
+
+    if user_id is None:
+        if settings.update_allowed_user_ids(None):
+            await ctx.send("✅ Whitelist disabled. Access mode is now: everyone except blocked users.")
+        else:
+            await ctx.send("❌ Failed to update configuration.")
+        return
+
+    if user_id not in allowed_ids:
+        await ctx.send(f"ℹ️ User `{user_id}` is not currently whitelisted.")
+        return
+
+    allowed_ids.remove(user_id)
+    next_value = sorted(allowed_ids) if allowed_ids else None
+    if settings.update_allowed_user_ids(next_value):
+        if next_value is None:
+            await ctx.send(
+                f"✅ User `{user_id}` removed. Whitelist is now empty, so whitelist mode was disabled."
+            )
+        else:
+            await ctx.send(f"✅ User `{user_id}` has been **removed from whitelist**.")
     else:
         await ctx.send("❌ Failed to update configuration.")
 
