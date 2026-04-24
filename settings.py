@@ -1,6 +1,9 @@
 import os
 import yaml
 import logging
+from urllib.parse import urlsplit
+
+from dotenv import load_dotenv
 
 try:
     from ruamel.yaml import YAML
@@ -8,6 +11,8 @@ except ImportError:
     YAML = None
 
 logger = logging.getLogger(__name__)
+
+load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 
 # Load configuration from config.yaml
 CONFIG_FILE = 'config.yaml'
@@ -34,6 +39,26 @@ def _get_bool(value, default=False):
 def _get_env_bool(name, default=False):
     """Parse boolean from environment variable with fallback default."""
     return _get_bool(os.getenv(name), default)
+
+
+def _normalize_origin(raw_origin):
+    """Normalize CORS origin to scheme://host[:port] for reliable matching."""
+    if not raw_origin:
+        return None
+
+    text = str(raw_origin).strip()
+    if not text:
+        return None
+
+    parsed = urlsplit(text)
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+
+    # Already a bare origin-like value without path.
+    if '://' in text and '/' not in text.split('://', 1)[1]:
+        return text.lower()
+
+    return None
 
 def load_config():
     """Load configuration from YAML file with sensible defaults."""
@@ -148,6 +173,26 @@ def get_ffmpeg_options():
 YTDL_OPTIONS = get_ytdl_options()
 FFMPEG_OPTIONS = get_ffmpeg_options()
 YT_BLACKLIST_PATTERNS = get_blacklist_patterns()
+
+# --- Web API Settings ---
+_web_cfg = _config.get('web_api', {}) or {}
+WEB_API_ENABLED = _get_bool(_web_cfg.get('enabled', True), True)
+WEB_API_HOST = str(os.getenv('MUSICBOT_WEB_API_HOST', _web_cfg.get('host', '127.0.0.1')))
+WEB_API_PORT = int(os.getenv('MUSICBOT_WEB_API_PORT', _web_cfg.get('port', 8080)))
+_raw_allowed_origins = _web_cfg.get('allowed_origins', ['http://localhost:5173'])
+WEB_API_ALLOWED_ORIGINS = []
+for item in _raw_allowed_origins:
+    normalized = _normalize_origin(item)
+    if normalized is None:
+        logger.warning("Ignoring invalid web_api.allowed_origins entry: %r", item)
+        continue
+    WEB_API_ALLOWED_ORIGINS.append(normalized)
+
+if not WEB_API_ALLOWED_ORIGINS:
+    WEB_API_ALLOWED_ORIGINS = ['http://localhost:5173']
+WEB_ADMIN_USERNAME = str(os.getenv('MUSICBOT_WEB_ADMIN_USERNAME', '')).strip()
+WEB_ADMIN_PASSWORD = str(os.getenv('MUSICBOT_WEB_ADMIN_PASSWORD', '')).strip()
+WEB_ADMIN_TOKEN_TTL_SECONDS = int(os.getenv('MUSICBOT_WEB_ADMIN_TOKEN_TTL_SECONDS', 86400))
 
 def save_config():
     """Save the current global _config to config.yaml."""

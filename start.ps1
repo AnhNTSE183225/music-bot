@@ -109,7 +109,126 @@ if ($runtimeMode -eq "debug") {
 
 Write-Host ""
 
-# Run the bot
-& "$venvPython" ".\bot.py"
+function Resolve-CaddyExecutable {
+    $overridePath = $env:MUSICBOT_CADDY_PATH
+    if ($overridePath -and (Test-Path $overridePath)) {
+        return (Resolve-Path $overridePath).Path
+    }
+
+    $cmd = Get-Command caddy -ErrorAction SilentlyContinue
+    if ($cmd) {
+        return $cmd.Source
+    }
+
+    return $null
+}
+
+function Start-ManagedProcess {
+    param(
+        [Parameter(Mandatory = $true)] [string] $Name,
+        [Parameter(Mandatory = $true)] [string] $FilePath,
+        [Parameter(Mandatory = $true)] [string[]] $Arguments,
+        [Parameter(Mandatory = $true)] [string] $Color
+    )
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $FilePath
+    foreach ($arg in $Arguments) {
+        [void] $psi.ArgumentList.Add($arg)
+    }
+    $psi.WorkingDirectory = (Get-Location).Path
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    $proc.EnableRaisingEvents = $true
+
+    $outEvent = Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -Action {
+        if ($EventArgs.Data) {
+            Write-Host "[$($Event.MessageData.Name)] $($EventArgs.Data)" -ForegroundColor $Event.MessageData.Color
+        }
+    } -MessageData @{ Name = $Name; Color = $Color }
+
+    $errEvent = Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived -Action {
+        if ($EventArgs.Data) {
+            Write-Host "[$($Event.MessageData.Name)] $($EventArgs.Data)" -ForegroundColor Red
+        }
+    } -MessageData @{ Name = $Name; Color = $Color }
+
+    [void] $proc.Start()
+    $proc.BeginOutputReadLine()
+    $proc.BeginErrorReadLine()
+
+    return @{
+        Name = $Name
+        Process = $proc
+        OutEvent = $outEvent
+        ErrEvent = $errEvent
+    }
+}
+
+function Stop-ManagedProcess {
+    param(
+        [Parameter(Mandatory = $true)] $Managed
+    )
+
+    if ($Managed.OutEvent) {
+        Unregister-Event -SourceIdentifier $Managed.OutEvent.Name -ErrorAction SilentlyContinue
+        Remove-Job -Id $Managed.OutEvent.Id -Force -ErrorAction SilentlyContinue
+    }
+    if ($Managed.ErrEvent) {
+        Unregister-Event -SourceIdentifier $Managed.ErrEvent.Name -ErrorAction SilentlyContinue
+        Remove-Job -Id $Managed.ErrEvent.Id -Force -ErrorAction SilentlyContinue
+    }
+
+    $proc = $Managed.Process
+    if ($proc -and -not $proc.HasExited) {
+        try {
+            $proc.Kill($true)
+            [void] $proc.WaitForExit(3000)
+        } catch {
+            Write-Host "WARN: Failed to stop $($Managed.Name) cleanly: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+}
+
+$managedProcesses = @()
+
+try {
+    $caddyExe = Resolve-CaddyExecutable
+    if ($caddyExe) {
+        if (-not (Test-Path ".\deploy\Caddyfile")) {
+            Write-Host "WARN: Caddy executable found but deploy/Caddyfile is missing. Skipping Caddy startup." -ForegroundColor Yellow
+        } else {
+            Write-Host "Starting Caddy (HTTPS reverse proxy)..." -ForegroundColor Magenta
+            $managedCaddy = Start-ManagedProcess -Name "Caddy" -FilePath $caddyExe -Arguments @("run", "--config", ".\deploy\Caddyfile") -Color "Magenta"
+            $managedProcesses += $managedCaddy
+        }
+    } else {
+        Write-Host "WARN: Caddy not found in PATH. Install Caddy or set MUSICBOT_CADDY_PATH to enable HTTPS proxy startup." -ForegroundColor Yellow
+    }
+
+    Write-Host "Starting MusicBot process..." -ForegroundColor Cyan
+    $managedBot = Start-ManagedProcess -Name "MusicBot" -FilePath "$venvPython" -Arguments @(".\bot.py") -Color "Cyan"
+    $managedProcesses += $managedBot
+
+    while (-not $managedBot.Process.HasExited) {
+        Wait-Event -Timeout 1 | Out-Null
+    }
+
+    if ($managedBot.Process.ExitCode -ne 0) {
+        Write-Host "MusicBot exited with code $($managedBot.Process.ExitCode)." -ForegroundColor Red
+    } else {
+        Write-Host "MusicBot exited cleanly." -ForegroundColor Green
+    }
+}
+finally {
+    foreach ($managed in ($managedProcesses | Sort-Object -Descending -Property Name)) {
+        Stop-ManagedProcess -Managed $managed
+    }
+}
 
 Read-Host "Press Enter to exit..."
