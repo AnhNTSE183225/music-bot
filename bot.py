@@ -12,6 +12,7 @@ import importlib
 import math
 import time
 from datetime import datetime, timedelta, timezone
+from yt_query_logic import is_probable_url, is_youtube_link, normalize_yt_search_term
 
 # Configure logging
 logging.basicConfig(
@@ -44,6 +45,9 @@ intents = discord.Intents.all()
 bot = commands.Bot(command_prefix=settings.COMMAND_PREFIX, intents=intents)
 
 ytdl = yt_dlp.YoutubeDL(settings.YTDL_OPTIONS)
+search_ytdl_options = dict(settings.YTDL_OPTIONS)
+search_ytdl_options['ignoreerrors'] = True
+search_ytdl = yt_dlp.YoutubeDL(search_ytdl_options)
 
 # GLOBAL VARIABLES
 song_queue = []
@@ -218,6 +222,67 @@ def find_best_match(query):
     # 3. Fuzzy Match
     close_matches = difflib.get_close_matches(query, files, n=1, cutoff=0.5)
     return close_matches[0] if close_matches else None
+
+
+async def get_playable_search_result(search_term, max_results=10):
+    """Resolve a search term to the first playable YouTube result.
+
+    Uses ignoreerrors for search listing so restricted/unavailable results are skipped,
+    then validates each candidate with the main yt-dlp options.
+    """
+    search_expr = f"ytsearch{max_results}:{search_term}"
+    data = await asyncio.to_thread(search_ytdl.extract_info, search_expr, False)
+    entries = []
+    if data and isinstance(data, dict):
+        entries = data.get('entries') or []
+
+    skip_count = 0
+    last_error = None
+
+    for entry in entries:
+        if not entry:
+            skip_count += 1
+            continue
+
+        title = entry.get('title') or "Unknown title"
+        if is_blacklisted_title(title):
+            logger.info("Skipping blacklisted YouTube title from search: %s", title)
+            skip_count += 1
+            continue
+
+        candidate_url = entry.get('webpage_url') or entry.get('url')
+        if not candidate_url:
+            skip_count += 1
+            continue
+
+        try:
+            candidate_data = await asyncio.to_thread(ytdl.extract_info, candidate_url, False)
+        except Exception as exc:
+            # Restricted, age-gated, private, or unavailable result. Try next.
+            last_error = exc
+            skip_count += 1
+            logger.warning("Skipping unavailable/restricted YouTube result '%s': %s", title, exc)
+            continue
+
+        if candidate_data and isinstance(candidate_data, dict) and 'entries' in candidate_data:
+            nested_entries = candidate_data.get('entries') or []
+            candidate_data = next((item for item in nested_entries if item), None)
+
+        if not candidate_data:
+            skip_count += 1
+            continue
+
+        stream_url = candidate_data.get('url')
+        webpage_url = candidate_data.get('webpage_url') or candidate_url
+        if not stream_url and not webpage_url:
+            skip_count += 1
+            continue
+
+        return candidate_data, skip_count
+
+    if last_error:
+        raise last_error
+    raise ValueError("No playable YouTube results found")
 
 async def ensure_voice_connected(ctx):
     """Ensure bot is connected to user's voice channel. Returns True on success."""
@@ -765,25 +830,42 @@ async def yt(ctx, *, query):
     if not ctx.voice_client or not ctx.voice_client.is_connected():
         return await ctx.send("❌ Failed to connect to voice channel.")
 
-    # 1. Determine if the user provided a LINK or a SEARCH PHRASE
-    if query.startswith(("http://", "https://", "www.")):
+    # 1. Determine if input is direct URL (YouTube or generic) or a search term.
+    #    Lyrics normalization is only for search terms.
+    if is_youtube_link(query):
         search_query = query
         await ctx.send(f"🔗 Loading link...")
+        query_type = 'url'
+    elif is_probable_url(query):
+        search_query = query
+        await ctx.send(f"🔗 Loading link...")
+        query_type = 'url'
     else:
-        search_query = f"ytsearch:{query}"
-        await ctx.send(f"🔎 Searching YouTube for: **{query}**...")
+        effective_search_term, lyrics_added = normalize_yt_search_term(query)
+        if lyrics_added:
+            await ctx.send(f"🔎 Searching YouTube for: **{effective_search_term}**...")
+        else:
+            await ctx.send(f"🔎 Searching YouTube for: **{query}**...")
+        query_type = 'search'
 
     try:
         yt_query_start = time.perf_counter()
-        # Run blocking yt-dlp call in executor to avoid freezing the event loop
-        data = await asyncio.to_thread(ytdl.extract_info, search_query, False)
-        yt_query_ms = int((time.perf_counter() - yt_query_start) * 1000)
-        
-        # 3. Handle Search Results vs Direct Links
-        if 'entries' in data:
-            video_data = data['entries'][0]
+        # Run blocking yt-dlp calls in a worker thread to avoid freezing the event loop.
+        if query_type == 'url':
+            data = await asyncio.to_thread(ytdl.extract_info, search_query, False)
+            skipped_results = 0
+            if data and isinstance(data, dict) and 'entries' in data:
+                entries = data.get('entries') or []
+                video_data = next((item for item in entries if item), None)
+            else:
+                video_data = data
         else:
-            video_data = data
+            video_data, skipped_results = await get_playable_search_result(effective_search_term, max_results=10)
+
+        yt_query_ms = int((time.perf_counter() - yt_query_start) * 1000)
+
+        if not video_data:
+            return await ctx.send("❌ Error: Could not find a playable YouTube result.")
         
         title = video_data['title']
 
@@ -800,10 +882,14 @@ async def yt(ctx, *, query):
         logger.debug(f"Using webpage URL: {webpage_url}")
         log_playback_metric(
             "yt_enqueue_extract",
-            query_type=('url' if search_query == query else 'search'),
+            query_type=query_type,
             extract_ms=yt_query_ms,
+            skipped_results=skipped_results,
             title=(title[:80] if title else None),
         )
+
+        if query_type == 'search' and skipped_results > 0:
+            await ctx.send(f"ℹ️ Skipped **{skipped_results}** unavailable/restricted result(s) before finding a playable match.")
         
         song_obj = make_song('youtube', title, webpage_url, ctx.author)
         if video_data.get('url'):
