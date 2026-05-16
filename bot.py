@@ -1,18 +1,24 @@
 import discord
 from discord.ext import commands
 import os
+import sys
 import asyncio
+import threading
 import yt_dlp
 import difflib
 import re
 from dotenv import load_dotenv
-import settings
 import logging
 import importlib
 import math
 import time
+import shlex
 from datetime import datetime, timedelta, timezone
 from yt_query_logic import is_probable_url, is_youtube_link, normalize_yt_search_term
+
+load_dotenv()
+
+import settings
 
 # Configure logging
 logging.basicConfig(
@@ -28,21 +34,19 @@ formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(messag
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 
-# Load Secrets
-load_dotenv()
 TOKEN = os.getenv(settings.TOKEN_ENV_VAR)
 
 # Validate token on startup
 if not TOKEN:
-    raise RuntimeError(
-        "DISCORD_TOKEN environment variable not set. "
-        "Please add it to your .env file or system environment."
-    )
+    TOKEN = None
 
 # --- SETUP ---
 intents = discord.Intents.all()
 
 bot = commands.Bot(command_prefix=settings.COMMAND_PREFIX, intents=intents)
+
+if settings.CONSOLE_USER_ID is not None:
+    bot.owner_id = settings.CONSOLE_USER_ID
 
 ytdl = yt_dlp.YoutubeDL(settings.YTDL_OPTIONS)
 search_ytdl_options = dict(settings.YTDL_OPTIONS)
@@ -60,6 +64,11 @@ empty_voice_leave_tasks = {}
 EMPTY_VOICE_LEAVE_DELAY_SECONDS = 10
 playback_monitor_tasks = {}
 loop_lag_monitor_task = None
+console_command_queue = None
+console_input_thread = None
+console_input_thread_stop = None
+console_command_consumer_task = None
+console_command_bridge_started = False
 
 # Cache blacklist patterns at module level (load once on startup)
 _blacklist_patterns = []
@@ -103,6 +112,266 @@ def log_playback_metric(event_name, **kwargs):
             continue
         fields.append(f"{key}={value}")
     logger.info("PLAYBACK_METRIC %s", " ".join(fields))
+
+
+class ConsoleChannel:
+    """Minimal channel adapter that prints command responses to stdout."""
+
+    def __init__(self, label="console"):
+        self.label = label
+
+    async def send(self, content=None, **kwargs):
+        if content is None:
+            content = kwargs.get('content')
+        if content is None and 'embed' in kwargs:
+            content = str(kwargs['embed'])
+        if content is not None:
+            print(f"[{self.label}] {content}")
+        return None
+
+
+class ConsoleAuthor:
+    """Proxy author that routes console commands through a fixed Discord identity."""
+
+    def __init__(self, user_id, display_name, voice=None):
+        self.id = user_id
+        self.name = display_name
+        self.display_name = display_name
+        self.mention = f"<@{user_id}>"
+        self.bot = False
+        self.voice = voice
+        self.guild_permissions = type("ConsoleGuildPermissions", (), {"administrator": True})()
+
+    def __str__(self):
+        return self.display_name
+
+
+def create_console_author(member=None, voice=None):
+    """Build a proxy author for console commands."""
+    display_name = "Console User"
+    if member is not None:
+        display_name = getattr(member, 'display_name', None) or getattr(member, 'name', None) or display_name
+
+    effective_voice = getattr(member, 'voice', None) or voice
+    return ConsoleAuthor(settings.CONSOLE_USER_ID, display_name, effective_voice)
+
+
+async def resolve_console_target():
+    """Find the guild and member context to emulate for console commands."""
+    if settings.CONSOLE_USER_ID is None:
+        return None, None
+
+    for guild in bot.guilds:
+        member = getattr(guild, 'get_member', lambda _user_id: None)(settings.CONSOLE_USER_ID)
+        if member is None and hasattr(guild, 'fetch_member'):
+            try:
+                member = await guild.fetch_member(settings.CONSOLE_USER_ID)
+            except Exception:
+                member = None
+
+        if member and getattr(member, 'voice', None) and member.voice.channel:
+            return guild, create_console_author(member)
+
+    for guild in bot.guilds:
+        voice_client = getattr(guild, 'voice_client', None)
+        if voice_client and voice_client.is_connected():
+            member = getattr(guild, 'get_member', lambda _user_id: None)(settings.CONSOLE_USER_ID)
+            if member is None and hasattr(guild, 'fetch_member'):
+                try:
+                    member = await guild.fetch_member(settings.CONSOLE_USER_ID)
+                except Exception:
+                    member = None
+
+            fallback_voice = type("ConsoleVoiceState", (), {"channel": voice_client.channel})()
+            return guild, create_console_author(member, fallback_voice)
+
+    if bot.guilds:
+        guild = bot.guilds[0]
+        member = getattr(guild, 'get_member', lambda _user_id: None)(settings.CONSOLE_USER_ID)
+        if member is None and hasattr(guild, 'fetch_member'):
+            try:
+                member = await guild.fetch_member(settings.CONSOLE_USER_ID)
+            except Exception:
+                member = None
+
+        return guild, create_console_author(member)
+
+    return None, None
+
+
+async def dispatch_console_command(raw_line):
+    """Run one console line through the same command parser as Discord messages."""
+    if not raw_line or not raw_line.strip():
+        return
+
+    prefix = settings.COMMAND_PREFIX
+    if not raw_line.startswith(prefix):
+        logger.info("Ignoring console input without command prefix: %s", raw_line)
+        return
+
+    command_line = raw_line[len(prefix):].strip()
+    if not command_line:
+        return
+
+    try:
+        parts = shlex.split(command_line)
+    except ValueError as exc:
+        logger.warning("Invalid console command syntax: %s (%s)", raw_line, exc)
+        return
+
+    if not parts:
+        return
+
+    command_name = parts[0].lower()
+    command = bot.get_command(command_name)
+    if command is None:
+        logger.warning("Unknown console command: %s", raw_line)
+        return
+
+    guild, author = await resolve_console_target()
+    if author is None:
+        logger.warning("Console commands are disabled until USER_ID is configured.")
+        return
+
+    logger.info(
+        "Console command received: %s (guild=%s, voice=%s)",
+        raw_line,
+        getattr(guild, 'name', None),
+        getattr(getattr(author, 'voice', None), 'channel', None),
+    )
+
+    message = type("ConsoleMessage", (), {})()
+    message.content = raw_line
+    message.author = author
+    message.guild = guild
+    message.channel = ConsoleChannel(guild.name if guild else "console")
+    message.attachments = []
+    message.reference = None
+    message.id = int(time.time() * 1000)
+
+    ctx = type("ConsoleContext", (), {})()
+    ctx.bot = bot
+    ctx.message = message
+    ctx.guild = guild
+    ctx.author = author
+    ctx.channel = message.channel
+    ctx.voice_client = getattr(guild, 'voice_client', None) if guild else None
+    ctx.command = command
+    ctx.invoked_with = command_name
+    ctx.prefix = prefix
+    ctx.args = []
+    ctx.kwargs = {}
+
+    async def send(content=None, **kwargs):
+        return await message.channel.send(content, **kwargs)
+
+    ctx.send = send
+
+    async def run_command():
+        if command_name in {'play', 'yt', 'blacklist'}:
+            query = command_line[len(command_name):].strip()
+            if command_name == 'blacklist':
+                await command.callback(ctx, pattern=(query or None))
+            else:
+                if not query:
+                    await ctx.send(f"❌ Usage: {prefix}{command_name} <query>")
+                    return
+                await command.callback(ctx, query=query)
+            return
+
+        if command_name in {'volume', 'skipto', 'remove'}:
+            if len(parts) < 2:
+                await ctx.send(f"❌ Usage: {prefix}{command_name} <number>")
+                return
+            try:
+                value = int(parts[1])
+            except ValueError:
+                await ctx.send(f"❌ `{parts[1]}` is not a valid number.")
+                return
+            await command.callback(ctx, value)
+            return
+
+        if command_name in {'block', 'unblock', 'whitelist', 'unwhitelist'}:
+            if len(parts) < 2:
+                await command.callback(ctx, None)
+                return
+            try:
+                user_id = int(parts[1])
+            except ValueError:
+                await ctx.send(f"❌ `{parts[1]}` is not a valid user ID.")
+                return
+            await command.callback(ctx, user_id)
+            return
+
+        await command.callback(ctx)
+
+    try:
+        await run_command()
+    except Exception as exc:
+        logger.error("Console command failed: %s", raw_line, exc_info=True)
+        await ctx.send(f"❌ Console command failed: {exc}")
+
+
+async def consume_console_commands():
+    """Consume console input lines sequentially on the bot event loop."""
+    while True:
+        raw_line = await console_command_queue.get()
+        if raw_line is None:
+            return
+        await dispatch_console_command(raw_line)
+
+
+def start_console_command_bridge():
+    """Start the stdin reader thread and the async consumer once."""
+    global console_command_queue, console_input_thread, console_input_thread_stop
+    global console_command_consumer_task, console_command_bridge_started
+
+    if console_command_bridge_started:
+        return
+
+    if settings.CONSOLE_USER_ID is None:
+        logger.info("Console command bridge disabled. Set USER_ID in .env to enable it.")
+        return
+
+    console_command_bridge_started = True
+    console_command_queue = asyncio.Queue()
+    console_input_thread_stop = threading.Event()
+    console_command_consumer_task = bot.loop.create_task(consume_console_commands())
+
+    def reader():
+        while not console_input_thread_stop.is_set():
+            line = sys.stdin.readline()
+            if line == "":
+                break
+
+            raw_line = line.rstrip("\r\n")
+            if not raw_line.strip():
+                continue
+
+            try:
+                asyncio.run_coroutine_threadsafe(console_command_queue.put(raw_line), bot.loop)
+            except RuntimeError:
+                break
+
+    console_input_thread = threading.Thread(target=reader, name="MusicBotConsoleInput", daemon=True)
+    console_input_thread.start()
+
+
+def stop_console_command_bridge():
+    """Stop the console bridge during shutdown."""
+    global console_input_thread_stop, console_command_consumer_task
+
+    if console_input_thread_stop is not None:
+        console_input_thread_stop.set()
+
+    if console_command_queue is not None:
+        try:
+            console_command_queue.put_nowait(None)
+        except Exception:
+            pass
+
+    if console_command_consumer_task and not console_command_consumer_task.done():
+        console_command_consumer_task.cancel()
 
 
 def cancel_playback_monitor(guild_id):
@@ -742,6 +1011,7 @@ async def play_next(ctx):
 @bot.event
 async def on_ready():
     logger.info(f'Logged in as {bot.user}')
+    start_console_command_bridge()
 
 @bot.event
 async def on_command_error(ctx, error):
@@ -1328,6 +1598,19 @@ async def setup_hook():
         logger.error(f"Failed to initialize blacklist: {e}", exc_info=True)
 
 # Main bot startup
-if __name__ == '__main__':
+async def main():
+    if not TOKEN:
+        raise RuntimeError(
+            "DISCORD_TOKEN environment variable not set. "
+            "Please add it to your .env file or system environment."
+        )
+
     logger.info("Starting MusicBot...")
-    bot.run(TOKEN)
+    try:
+        await bot.start(TOKEN)
+    finally:
+        stop_console_command_bridge()
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
