@@ -14,6 +14,15 @@ class FakeVoiceClient:
         return self._connected
 
 
+class FakeVoiceChannel:
+    def __init__(self, name="Voice", connected_client=None):
+        self.name = name
+        self.connected_client = connected_client or FakeVoiceClient(channel=SimpleNamespace(name=name), connected=True)
+
+    async def connect(self, timeout=None, reconnect=True):
+        return self.connected_client
+
+
 class FakeMember:
     def __init__(self, user_id, display_name="Console User", voice=None):
         self.id = user_id
@@ -41,6 +50,22 @@ class FakeGuild:
 
 
 class TestConsoleCommands(unittest.IsolatedAsyncioTestCase):
+    async def test_ensure_voice_connected_updates_console_context(self):
+        voice_client = FakeVoiceClient(channel=SimpleNamespace(name="Lounge"), connected=True)
+        voice_channel = FakeVoiceChannel(name="Lounge", connected_client=voice_client)
+        ctx = SimpleNamespace(
+            voice_client=None,
+            guild=SimpleNamespace(voice_client=None, id=123),
+            author=SimpleNamespace(voice=SimpleNamespace(channel=voice_channel)),
+            send=lambda *args, **kwargs: None,
+        )
+
+        result = await musicbot.ensure_voice_connected(ctx)
+
+        self.assertTrue(result)
+        self.assertIs(ctx.voice_client, voice_client)
+        self.assertIs(ctx.guild.voice_client, voice_client)
+
     async def test_owner_voice_is_preferred(self):
         owner_id = 368435858950324235
         connected_guild = FakeGuild(

@@ -19,16 +19,10 @@ class TestYtQueryLogic(unittest.TestCase):
         self.assertTrue(is_probable_url("www.example.com/test"))
         self.assertFalse(is_probable_url("just a search query"))
 
-    def test_normalize_yt_search_term_adds_lyrics_when_missing(self):
+    def test_normalize_yt_search_term(self):
         query, added = normalize_yt_search_term("into the unknown")
-        self.assertEqual(query, "into the unknown lyrics")
-        self.assertTrue(added)
-
-    def test_normalize_yt_search_term_keeps_existing_lyrics(self):
-        query, added = normalize_yt_search_term("into the unknown Lyrics")
-        self.assertEqual(query, "into the unknown Lyrics")
+        self.assertEqual(query, "into the unknown")
         self.assertFalse(added)
-
 
 if __name__ == "__main__":
     unittest.main()

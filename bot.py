@@ -2,6 +2,7 @@ import discord
 from discord.ext import commands
 import os
 import sys
+import io
 import asyncio
 import threading
 import yt_dlp
@@ -20,15 +21,24 @@ load_dotenv()
 
 import settings
 
-# Configure logging
+# Configure logging with UTF-8 encoding to handle emoji and Unicode characters
+# Create a UTF-8 stream wrapper for stdout to handle emoji
+class UTF8StreamHandler(logging.StreamHandler):
+    def __init__(self):
+        # Use a UTF-8 text wrapper around stdout.buffer
+        utf8_stream = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+        super().__init__(utf8_stream)
+
+# Configure logging with custom UTF-8 handler
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL, logging.INFO),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[UTF8StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
-# Also log to file
-file_handler = logging.FileHandler(settings.LOG_FILE)
+# Configure file handler with UTF-8 encoding to handle emoji and Unicode
+file_handler = logging.FileHandler(settings.LOG_FILE, encoding='utf-8')
 file_handler.setLevel(getattr(logging, settings.LOG_LEVEL, logging.INFO))
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 file_handler.setFormatter(formatter)
@@ -233,12 +243,19 @@ async def dispatch_console_command(raw_line):
         logger.warning("Console commands are disabled until USER_ID is configured.")
         return
 
-    logger.info(
-        "Console command received: %s (guild=%s, voice=%s)",
-        raw_line,
-        getattr(guild, 'name', None),
-        getattr(getattr(author, 'voice', None), 'channel', None),
-    )
+    # Log guild name and voice safely (avoid Unicode encoding issues on Windows console)
+    guild_name = getattr(guild, 'name', 'unknown')
+    voice_channel = getattr(getattr(author, 'voice', None), 'channel', None)
+    try:
+        logger.info(
+            "Console command received: %s (guild=%s, voice=%s)",
+            raw_line,
+            str(guild_name),
+            str(voice_channel),
+        )
+    except UnicodeEncodeError:
+        # Fallback for console encoding issues
+        logger.info("Console command received: %s", raw_line)
 
     message = type("ConsoleMessage", (), {})()
     message.content = raw_line
@@ -339,19 +356,30 @@ def start_console_command_bridge():
     console_command_consumer_task = bot.loop.create_task(consume_console_commands())
 
     def reader():
-        while not console_input_thread_stop.is_set():
-            line = sys.stdin.readline()
-            if line == "":
-                break
+        try:
+            while not console_input_thread_stop.is_set():
+                try:
+                    line = sys.stdin.readline()
+                    if line == "":
+                        break
 
-            raw_line = line.rstrip("\r\n")
-            if not raw_line.strip():
-                continue
+                    raw_line = line.rstrip("\r\n")
+                    if not raw_line.strip():
+                        continue
 
-            try:
-                asyncio.run_coroutine_threadsafe(console_command_queue.put(raw_line), bot.loop)
-            except RuntimeError:
-                break
+                    try:
+                        asyncio.run_coroutine_threadsafe(console_command_queue.put(raw_line), bot.loop)
+                    except RuntimeError:
+                        break
+                except (EOFError, ValueError):
+                    # stdin closed or other readline error
+                    break
+        except KeyboardInterrupt:
+            # Handle Ctrl+C in reader thread
+            pass
+        finally:
+            # Signal the stop event to ensure clean shutdown
+            console_input_thread_stop.set()
 
     console_input_thread = threading.Thread(target=reader, name="MusicBotConsoleInput", daemon=True)
     console_input_thread.start()
@@ -553,6 +581,7 @@ async def get_playable_search_result(search_term, max_results=10):
         raise last_error
     raise ValueError("No playable YouTube results found")
 
+
 async def ensure_voice_connected(ctx):
     """Ensure bot is connected to user's voice channel. Returns True on success."""
     if ctx.voice_client and ctx.voice_client.is_connected():
@@ -564,7 +593,10 @@ async def ensure_voice_connected(ctx):
     
     try:
         started = time.perf_counter()
-        await ctx.author.voice.channel.connect(timeout=settings.CONNECTION_TIMEOUT, reconnect=True)
+        voice_client = await ctx.author.voice.channel.connect(timeout=settings.CONNECTION_TIMEOUT, reconnect=True)
+        ctx.voice_client = voice_client
+        if ctx.guild is not None:
+            ctx.guild.voice_client = voice_client
         await asyncio.sleep(settings.CONNECTION_STABILIZE_DELAY)
         elapsed = time.perf_counter() - started
         log_playback_metric(
@@ -1111,11 +1143,8 @@ async def yt(ctx, *, query):
         await ctx.send(f"🔗 Loading link...")
         query_type = 'url'
     else:
-        effective_search_term, lyrics_added = normalize_yt_search_term(query)
-        if lyrics_added:
-            await ctx.send(f"🔎 Searching YouTube for: **{effective_search_term}**...")
-        else:
-            await ctx.send(f"🔎 Searching YouTube for: **{query}**...")
+        effective_search_term, _ = normalize_yt_search_term(query)
+        await ctx.send(f"🔎 Searching YouTube for: **{query}**...")
         query_type = 'search'
 
     try:
@@ -1184,6 +1213,7 @@ async def yt(ctx, *, query):
     except Exception as e:
         logger.error(f"Error in yt command: {e}", exc_info=True)
         await ctx.send(f"❌ Error: {e}")
+
 
 @bot.command()
 async def volume(ctx, volume: int):
@@ -1608,9 +1638,20 @@ async def main():
     logger.info("Starting MusicBot...")
     try:
         await bot.start(TOKEN)
+    except KeyboardInterrupt:
+        logger.info("Received Ctrl+C, shutting down gracefully...")
+        await bot.close()
     finally:
         stop_console_command_bridge()
 
 
-if __name__ == '__main__':
-    asyncio.run(main())
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("MusicBot terminated by user.")
+        print("\nMusicBot terminated by user.")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        print(f"\nFatal error: {e}")
+        raise

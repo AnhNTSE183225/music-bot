@@ -14,9 +14,6 @@ def is_probable_url(query):
 
 
 def normalize_yt_search_term(query):
-    """For search terms, append 'lyrics' unless already present."""
+    """For search terms, just return the stripped query."""
     stripped_query = (query or "").strip()
-    has_lyrics = bool(re.search(r'\blyrics\b', stripped_query, re.IGNORECASE))
-    if has_lyrics:
-        return stripped_query, False
-    return f"{stripped_query} lyrics", True
+    return stripped_query, False
