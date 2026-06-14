@@ -82,6 +82,9 @@ permissions:
     yt:
       mode: "open"
 
+    playlist:
+      mode: "open"
+
     queue:
       mode: "open"
 

@@ -35,6 +35,19 @@ def _get_env_bool(name, default=False):
     """Parse boolean from environment variable with fallback default."""
     return _get_bool(os.getenv(name), default)
 
+
+def _get_env_int(name, default=None):
+    """Parse an integer from environment variables with fallback default."""
+    raw_value = os.getenv(name)
+    if raw_value is None or str(raw_value).strip() == "":
+        return default
+
+    try:
+        return int(str(raw_value).strip())
+    except (TypeError, ValueError):
+        logger.warning("Invalid integer value for %s: %r", name, raw_value)
+        return default
+
 def load_config():
     """Load configuration from YAML file with sensible defaults."""
     if not os.path.exists(CONFIG_FILE):
@@ -67,6 +80,7 @@ if RUNTIME_MODE not in {'debug', 'prod'}:
 # --- Discord Settings ---
 COMMAND_PREFIX = _config.get('discord', {}).get('command_prefix', '!')
 TOKEN_ENV_VAR = _config.get('discord', {}).get('token_env_var', 'DISCORD_TOKEN')
+CONSOLE_USER_ID = _get_env_int('USER_ID')
 
 # --- Playback Settings ---
 DEFAULT_VOLUME = _config.get('playback', {}).get('default_volume', 0.5)

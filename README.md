@@ -20,6 +20,8 @@ The script automatically handles everything:
 - Installs dependencies from `requirements.txt` (on first run and when requirements change)
 - Runs the bot
 
+If you want to drive the bot from the terminal, add `USER_ID=<your Discord user ID>` to `.env`. Console lines that start with the normal command prefix, such as `!yt` or `!skip`, will be executed as that Discord identity and will target the guild/voice channel it is currently using.
+
 That's it—no separate setup required! ✨
 
 ## Virtual Environment Benefits
