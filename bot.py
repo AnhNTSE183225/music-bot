@@ -64,12 +64,10 @@ search_ytdl_options['ignoreerrors'] = True
 search_ytdl = yt_dlp.YoutubeDL(search_ytdl_options)
 
 # GLOBAL VARIABLES
-song_queue = []
-current_volume = settings.DEFAULT_VOLUME
-play_next_lock = asyncio.Lock()
+music_state_by_guild = {}
+play_next_locks_by_guild = {}
 votes_by_guild = {}
 next_queue_id = 1
-current_song = None  # Track the currently playing song for status display
 empty_voice_leave_tasks = {}
 EMPTY_VOICE_LEAVE_DELAY_SECONDS = 10
 playback_monitor_tasks = {}
@@ -122,6 +120,74 @@ def log_playback_metric(event_name, **kwargs):
             continue
         fields.append(f"{key}={value}")
     logger.info("PLAYBACK_METRIC %s", " ".join(fields))
+
+
+def get_music_state(guild):
+    """Return the mutable playback state for one guild."""
+    guild_id = getattr(guild, 'id', None)
+    if guild_id is None:
+        return None
+
+    state = music_state_by_guild.get(guild_id)
+    if state is None:
+        state = {
+            'queue': [],
+            'current_song': None,
+            'volume': settings.DEFAULT_VOLUME,
+        }
+        music_state_by_guild[guild_id] = state
+    return state
+
+
+def get_music_queue(guild):
+    state = get_music_state(guild)
+    return state['queue'] if state else []
+
+
+def get_current_song(guild):
+    state = get_music_state(guild)
+    return state['current_song'] if state else None
+
+
+def set_current_song(guild, song):
+    state = get_music_state(guild)
+    if state is not None:
+        state['current_song'] = song
+
+
+def get_music_volume(guild):
+    state = get_music_state(guild)
+    return state['volume'] if state else settings.DEFAULT_VOLUME
+
+
+def set_music_volume(guild, volume):
+    state = get_music_state(guild)
+    if state is not None:
+        state['volume'] = volume
+
+
+def clear_music_state(guild):
+    state = get_music_state(guild)
+    if state is not None:
+        state['queue'].clear()
+        state['current_song'] = None
+
+
+def any_music_playing():
+    return any(state.get('current_song') for state in music_state_by_guild.values())
+
+
+async def clear_bot_status_if_idle():
+    if not any_music_playing():
+        await clear_bot_status()
+
+
+def get_play_next_lock(guild_id):
+    lock = play_next_locks_by_guild.get(guild_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        play_next_locks_by_guild[guild_id] = lock
+    return lock
 
 
 class ConsoleChannel:
@@ -431,7 +497,7 @@ def start_playback_monitor(ctx, song, playback_started_perf):
                 if not voice_client or not voice_client.is_connected():
                     break
 
-                active_song = current_song
+                active_song = get_current_song(ctx.guild)
                 if not active_song or active_song.get('queue_id') != queue_id:
                     break
 
@@ -596,7 +662,10 @@ async def ensure_voice_connected(ctx):
         voice_client = await ctx.author.voice.channel.connect(timeout=settings.CONNECTION_TIMEOUT, reconnect=True)
         ctx.voice_client = voice_client
         if ctx.guild is not None:
-            ctx.guild.voice_client = voice_client
+            try:
+                ctx.guild.voice_client = voice_client
+            except (AttributeError, TypeError):
+                pass
         await asyncio.sleep(settings.CONNECTION_STABILIZE_DELAY)
         elapsed = time.perf_counter() - started
         log_playback_metric(
@@ -732,7 +801,6 @@ def ensure_empty_voice_leave_timer(guild):
         return
 
     async def leave_if_still_empty():
-        global current_song
         try:
             await asyncio.sleep(EMPTY_VOICE_LEAVE_DELAY_SECONDS)
             fresh_voice_client = guild.voice_client
@@ -741,12 +809,11 @@ def ensure_empty_voice_leave_timer(guild):
             if get_non_bot_voice_member_count(fresh_voice_client) > 0:
                 return
 
-            current_song = None
-            song_queue.clear()
+            clear_music_state(guild)
             clear_votes(guild_id)
             fresh_voice_client.stop()
             await fresh_voice_client.disconnect()
-            await clear_bot_status()
+            await clear_bot_status_if_idle()
             logger.info(
                 "Disconnected from voice in guild %s after %s seconds with no listeners.",
                 guild_id,
@@ -832,7 +899,11 @@ def validate_command_permissions_config():
 
 async def play_next(ctx):
     """Plays the next item in the queue with volume control. Must be called within play_next_lock."""
-    global current_song
+    music_state = get_music_state(ctx.guild)
+    if music_state is None:
+        return
+
+    queue = music_state['queue']
 
     # Check if voice client exists and is connected
     if not ctx.voice_client or not ctx.voice_client.is_connected():
@@ -843,13 +914,13 @@ async def play_next(ctx):
     if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
         return
 
-    if not song_queue:
-        current_song = None
-        await clear_bot_status()
+    if not queue:
+        music_state['current_song'] = None
+        await clear_bot_status_if_idle()
         return
 
-    song = song_queue.pop(0)
-    current_song = song  # Track currently playing song
+    song = queue.pop(0)
+    music_state['current_song'] = song  # Track currently playing song
     queue_wait_ms = int((time.perf_counter() - song.get('enqueued_perf', time.perf_counter())) * 1000)
 
     try:
@@ -949,13 +1020,13 @@ async def play_next(ctx):
 
         # 2. Apply Volume Transformer
         source = discord.PCMVolumeTransformer(source)
-        source.volume = current_volume
+        source.volume = get_music_volume(ctx.guild)
 
         # 3. Play - double check connection and playback state before playing
         if ctx.voice_client and ctx.voice_client.is_connected():
             if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
                 # Another call started playback while we were preparing this source.
-                song_queue.insert(0, song)
+                queue.insert(0, song)
                 return
 
             playback_started = time.perf_counter()
@@ -983,7 +1054,7 @@ async def play_next(ctx):
                 # Schedule play_next with lock to prevent race conditions
                 async def next_with_lock():
                     lock_wait_start = time.perf_counter()
-                    async with play_next_lock:
+                    async with get_play_next_lock(getattr(ctx.guild, 'id', None)):
                         lock_wait_ms = int((time.perf_counter() - lock_wait_start) * 1000)
                         if lock_wait_ms >= 100:
                             log_playback_metric(
@@ -1013,7 +1084,7 @@ async def play_next(ctx):
                 queue_id=song.get('queue_id'),
                 source_type=song.get('type'),
                 queue_wait_ms=queue_wait_ms,
-                queue_size_after_pop=len(song_queue),
+                queue_size_after_pop=len(queue),
                 guild_id=getattr(ctx.guild, 'id', None),
             )
             
@@ -1022,11 +1093,11 @@ async def play_next(ctx):
             
             await ctx.send(
                 f"🎶 **Now Playing:** {song['title']} "
-                f"(requested by {song.get('requester_mention', 'unknown')}, Vol: {int(current_volume * 100)}%)"
+                f"(requested by {song.get('requester_mention', 'unknown')}, Vol: {int(get_music_volume(ctx.guild) * 100)}%)"
             )
         else:
             logger.warning("Lost connection before playing")
-            song_queue.insert(0, song)  # Put song back in queue
+            queue.insert(0, song)  # Put song back in queue
             await ctx.send("❌ Lost voice connection")
 
     except Exception as e:
@@ -1035,7 +1106,7 @@ async def play_next(ctx):
         # Try next song after a small delay
         await asyncio.sleep(1)
         if ctx.voice_client and ctx.voice_client.is_connected():
-            async with play_next_lock:
+            async with get_play_next_lock(getattr(ctx.guild, 'id', None)):
                 await play_next(ctx)
 
 # --- EVENTS ---
@@ -1083,7 +1154,13 @@ async def join(ctx):
             await ctx.send(f"🔄 Moved to **{channel}**")
         else:
             started = time.perf_counter()
-            await channel.connect(timeout=settings.CONNECTION_TIMEOUT, reconnect=True)
+            voice_client = await channel.connect(timeout=settings.CONNECTION_TIMEOUT, reconnect=True)
+            ctx.voice_client = voice_client
+            if ctx.guild is not None:
+                try:
+                    ctx.guild.voice_client = voice_client
+                except (AttributeError, TypeError):
+                    pass
             await asyncio.sleep(settings.CONNECTION_STABILIZE_DELAY)
             elapsed = time.perf_counter() - started
             log_playback_metric(
@@ -1114,9 +1191,10 @@ async def play(ctx, *, query):
         return await ctx.send(f"❌ File not found matching: {query}")
 
     song_obj = make_song('local', filename, filename, ctx.author)
-    song_queue.append(song_obj)
+    queue = get_music_queue(ctx.guild)
+    queue.append(song_obj)
 
-    async with play_next_lock:
+    async with get_play_next_lock(getattr(ctx.guild, 'id', None)):
         if not ctx.voice_client.is_playing():
             await play_next(ctx)
         else:
@@ -1197,14 +1275,15 @@ async def yt(ctx, *, query):
         song_obj['format_id'] = video_data.get('format_id')
         song_obj['ext'] = video_data.get('ext')
         song_obj['duration'] = video_data.get('duration')
-        song_queue.append(song_obj)
+        queue = get_music_queue(ctx.guild)
+        queue.append(song_obj)
         logger.debug(f"Added song to queue - Title: {title}")
 
         # Double-check voice connection before playing
         if not ctx.voice_client:
             return await ctx.send("❌ Lost voice connection.")
 
-        async with play_next_lock:
+        async with get_play_next_lock(getattr(ctx.guild, 'id', None)):
             if not ctx.voice_client.is_playing():
                 await play_next(ctx)
             else:
@@ -1218,8 +1297,6 @@ async def yt(ctx, *, query):
 @bot.command()
 async def volume(ctx, volume: int):
     """Sets volume (0-100). Usage: !volume <0-100>"""
-    global current_volume
-
     if not await enforce_command_access(ctx, 'volume'):
         return
     
@@ -1228,11 +1305,12 @@ async def volume(ctx, volume: int):
         return await ctx.send(f"❌ Volume must be between 0-100. You entered: {volume}")
 
     # Convert to float (0.0 - 1.0)
-    current_volume = volume / 100
+    music_volume = volume / 100
+    set_music_volume(ctx.guild, music_volume)
 
     # Adjust currently playing song immediately
     if ctx.voice_client and ctx.voice_client.source:
-        ctx.voice_client.source.volume = current_volume
+        ctx.voice_client.source.volume = music_volume
 
     await ctx.send(f"🔊 Volume set to **{volume}%**")
 
@@ -1254,6 +1332,7 @@ async def skip(ctx):
         return
 
     # Let the requester skip their own currently playing song directly.
+    current_song = get_current_song(ctx.guild)
     if current_song and current_song.get('requester_id') == ctx.author.id:
         clear_votes(ctx.guild.id, action_key='skip')
         ctx.voice_client.stop()
@@ -1294,13 +1373,14 @@ async def skip(ctx):
 @bot.command()
 async def queue(ctx):
     """Lists the current queue."""
-    if not song_queue:
+    queue = get_music_queue(ctx.guild)
+    if not queue:
         await ctx.send("The queue is currently empty.")
         return
 
     # Build the string
     queue_list = "**Upcoming Songs:**\n"
-    for i, song in enumerate(song_queue):
+    for i, song in enumerate(queue):
         # i+1 makes it human readable (1, 2, 3 instead of 0, 1, 2)
         queue_list += f"`{i+1}.` {song['title']} - added by {song.get('requester_handle', 'unknown')}\n"
 
@@ -1315,6 +1395,7 @@ async def queue(ctx):
 @bot.command()
 async def current(ctx):
     """Shows the currently playing song."""
+    current_song = get_current_song(ctx.guild)
     if not current_song:
         await ctx.send("❌ No song is currently playing.")
         return
@@ -1334,17 +1415,18 @@ async def skipto(ctx, index: int):
         await ctx.send("❌ Nothing is playing right now.")
         return
 
-    if not song_queue:
+    queue = get_music_queue(ctx.guild)
+    if not queue:
         await ctx.send("❌ The queue is empty.")
         return
 
     # Validate the number
-    if index < 1 or index > len(song_queue):
-        return await ctx.send(f"❌ Invalid position. Please choose between 1 and {len(song_queue)}.")
+    if index < 1 or index > len(queue):
+        return await ctx.send(f"❌ Invalid position. Please choose between 1 and {len(queue)}.")
 
     # Logic: Slice the queue to remove everything BEFORE the target
     # index-1 because users see 1-based, list is 0-based
-    song_queue[:] = song_queue[index-1:]
+    queue[:] = queue[index-1:]
 
     # Stop the current song. This triggers 'play_next', which pulls from our NEW shortened queue.
     ctx.voice_client.stop()
@@ -1356,7 +1438,7 @@ async def clear(ctx):
     if not await enforce_command_access(ctx, 'clear'):
         return
 
-    song_queue.clear()
+    get_music_queue(ctx.guild).clear()
     if ctx.guild:
         clear_votes(ctx.guild.id)
     await ctx.send("🗑️ **Queue cleared.**")
@@ -1367,9 +1449,7 @@ async def stop(ctx):
     if not await enforce_command_access(ctx, 'stop'):
         return
 
-    global current_song
-    current_song = None
-    song_queue.clear()
+    clear_music_state(ctx.guild)
     if ctx.guild:
         cancel_empty_voice_leave_timer(ctx.guild.id)
         clear_votes(ctx.guild.id)
@@ -1377,7 +1457,7 @@ async def stop(ctx):
     if ctx.voice_client:
         ctx.voice_client.stop()
         await ctx.voice_client.disconnect()
-        await clear_bot_status()
+        await clear_bot_status_if_idle()
         await ctx.send("🛑 Stopped and disconnected.")
     else:
         await ctx.send("❌ Not connected to a voice channel.")
@@ -1386,22 +1466,23 @@ async def stop(ctx):
 @bot.command()
 async def remove(ctx, index: int):
     """Removes a song from queue by index. Owner/admin can remove directly; others require vote."""
-    if not song_queue:
+    queue = get_music_queue(ctx.guild)
+    if not queue:
         await ctx.send("❌ The queue is empty.")
         return
 
-    if index < 1 or index > len(song_queue):
-        await ctx.send(f"❌ Invalid position. Please choose between 1 and {len(song_queue)}.")
+    if index < 1 or index > len(queue):
+        await ctx.send(f"❌ Invalid position. Please choose between 1 and {len(queue)}.")
         return
 
-    target = song_queue[index - 1]
+    target = queue[index - 1]
     vote_cfg = settings.get_skip_vote_config()
     force_vote_for_admin = vote_cfg.get('force_vote_for_admin', False)
     is_admin = is_admin_member(ctx.author)
     is_owner = target.get('requester_id') == ctx.author.id
 
     if (is_admin and not force_vote_for_admin) or is_owner:
-        removed_song = song_queue.pop(index - 1)
+        removed_song = queue.pop(index - 1)
         if ctx.guild:
             clear_votes(ctx.guild.id, action_key=f"remove:{removed_song['queue_id']}")
         await ctx.send(f"🗑️ Removed `#{index}`: **{removed_song['title']}**")
@@ -1422,13 +1503,13 @@ async def remove(ctx, index: int):
         return
 
     if current_votes >= required_votes:
-        current_index = next((i for i, s in enumerate(song_queue) if s.get('queue_id') == target['queue_id']), None)
+        current_index = next((i for i, s in enumerate(queue) if s.get('queue_id') == target['queue_id']), None)
         if current_index is None:
             clear_votes(ctx.guild.id, action_key=action_key)
             await ctx.send("ℹ️ That song is no longer in the queue.")
             return
 
-        removed_song = song_queue.pop(current_index)
+        removed_song = queue.pop(current_index)
         clear_votes(ctx.guild.id, action_key=action_key)
         await ctx.send(
             f"🗑️ Vote passed (**{current_votes}/{required_votes}** of {eligible_count} listeners). "
