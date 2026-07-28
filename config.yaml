@@ -12,7 +12,7 @@ discord:
 
 # Voice & Playback Settings
 playback:
-  default_volume: 0.5  # 0.0 - 1.0 (50%)
+  default_volume: 1  # 0.0 - 1.0 (50%)
   connection_timeout: 10.0
   connection_stabilize_delay: 1.5
   debug_metrics: false  # usually auto-overridden by runtime.mode in run.ps1
@@ -90,6 +90,9 @@ permissions:
 
     current:
       mode: "open"
+
+    loop:
+      mode: "admin_only"
 
     skip:
       mode: "vote_if_non_admin"
