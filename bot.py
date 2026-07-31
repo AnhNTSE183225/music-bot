@@ -335,13 +335,17 @@ async def dispatch_console_command(raw_line):
     message.reference = None
     message.id = int(time.time() * 1000)
 
-    ctx = type("ConsoleContext", (), {})()
+    class ConsoleContext:
+        @property
+        def voice_client(self):
+            return getattr(self.guild, 'voice_client', None) if getattr(self, 'guild', None) else None
+
+    ctx = ConsoleContext()
     ctx.bot = bot
     ctx.message = message
     ctx.guild = guild
     ctx.author = author
     ctx.channel = message.channel
-    ctx.voice_client = getattr(guild, 'voice_client', None) if guild else None
     ctx.command = command
     ctx.invoked_with = command_name
     ctx.prefix = prefix
