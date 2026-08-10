@@ -1246,6 +1246,8 @@ async def yt(ctx, *, query):
         query_type = 'url'
     else:
         effective_search_term, _ = normalize_yt_search_term(query)
+        if is_blacklisted_title(query) or is_blacklisted_title(effective_search_term):
+            return await ctx.send("❌ This song is in the blacklist.")
         await ctx.send(f"🔎 Searching YouTube for: **{query}**...")
         query_type = 'search'
 

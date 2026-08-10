@@ -64,6 +64,10 @@ if (-not (Test-Path $venvMarker) -or $requirementsChanged -or -not $depsHealthy)
 }
 
 Write-Host ""
+Write-Host "Checking for pip and yt-dlp updates..." -ForegroundColor Cyan
+& "$venvPython" "-m" "pip" "install" "-U" "pip" "yt-dlp"
+
+Write-Host ""
 Write-Host "Starting bot..." -ForegroundColor Cyan
 Write-Host ""
 
