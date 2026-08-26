@@ -63,6 +63,13 @@ if (-not (Test-Path $venvMarker) -or $requirementsChanged -or -not $depsHealthy)
     Write-Host "OK: Dependencies installed" -ForegroundColor Green
 }
 
+$nodeExePath = ".\venv\Scripts\node.exe"
+if (-not (Test-Path $nodeExePath)) {
+    Write-Host "Downloading portable Node.js for yt-dlp JS challenges..." -ForegroundColor Yellow
+    Invoke-WebRequest -Uri "https://nodejs.org/dist/v20.11.1/win-x64/node.exe" -OutFile $nodeExePath
+    Write-Host "OK: Node.js downloaded" -ForegroundColor Green
+}
+
 Write-Host ""
 Write-Host "Checking for pip and yt-dlp updates..." -ForegroundColor Cyan
 & "$venvPython" "-m" "pip" "install" "-U" "pip" "yt-dlp"
@@ -112,6 +119,9 @@ if ($runtimeMode -eq "debug") {
 }
 
 Write-Host ""
+
+# Add venv to PATH so yt-dlp can find node.exe
+$env:PATH = "$((Resolve-Path .\venv\Scripts).Path);$env:PATH"
 
 # Run the bot
 & "$venvPython" ".\bot.py"

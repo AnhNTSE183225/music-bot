@@ -56,7 +56,7 @@ ytdl_options:
 
 # FFmpeg Stream Options
 ffmpeg:
-  before_options: "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -thread_queue_size 1024 -fflags +genpts"
+  before_options: "-v warning -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -thread_queue_size 1024 -fflags +genpts"
   audio_only: "-vn -ar 48000 -ac 2"
 
 # Command Permissions (2 roles: admin and non-admin)
@@ -77,10 +77,10 @@ permissions:
       mode: "open"
 
     play:
-      mode: "open"
+      mode: "admin_only"
 
     yt:
-      mode: "open"
+      mode: "admin_only"
 
     playlist:
       mode: "open"

@@ -51,6 +51,31 @@ if not TOKEN:
     TOKEN = None
 
 # --- SETUP ---
+import subprocess
+import threading
+
+class LoggingFFmpegPCMAudio(discord.FFmpegPCMAudio):
+    def __init__(self, *args, **kwargs):
+        # We need to capture stderr. FFmpegPCMAudio uses subprocess.Popen.
+        # So we pass stderr=subprocess.PIPE to it.
+        kwargs['stderr'] = subprocess.PIPE
+        super().__init__(*args, **kwargs)
+        
+        # Now self._process is the Popen object
+        self._stderr_thread = threading.Thread(target=self._log_stderr)
+        self._stderr_thread.daemon = True
+        self._stderr_thread.start()
+
+    def _log_stderr(self):
+        if hasattr(self, '_process') and self._process and self._process.stderr:
+            for line in iter(self._process.stderr.readline, b''):
+                if not line:
+                    break
+                try:
+                    logger.warning(f"[ffmpeg] {line.decode('utf-8', 'ignore').strip()}")
+                except Exception:
+                    pass
+
 intents = discord.Intents.all()
 
 bot = commands.Bot(command_prefix=settings.COMMAND_PREFIX, intents=intents)
@@ -814,11 +839,16 @@ def ensure_empty_voice_leave_timer(guild):
                 return
             if get_non_bot_voice_member_count(fresh_voice_client) > 0:
                 return
+            if fresh_voice_client.is_playing() or fresh_voice_client.is_paused():
+                return
 
             clear_music_state(guild)
             clear_votes(guild_id)
             fresh_voice_client.stop()
-            await fresh_voice_client.disconnect()
+            try:
+                await asyncio.wait_for(fresh_voice_client.disconnect(force=True), timeout=5.0)
+            except Exception as e:
+                logger.warning("Voice disconnect timed out/failed: %s", e)
             await clear_bot_status_if_idle()
             logger.info(
                 "Disconnected from voice in guild %s after %s seconds with no listeners.",
@@ -954,7 +984,7 @@ async def play_next(ctx):
         if song['type'] == 'local':
             source_path = os.path.join(settings.MEDIA_FOLDER, song['data'])
             source_init_start = time.perf_counter()
-            source = discord.FFmpegPCMAudio(source_path)
+            source = LoggingFFmpegPCMAudio(source_path)
             source_init_ms = int((time.perf_counter() - source_init_start) * 1000)
             log_playback_metric(
                 "source_created",
@@ -1014,7 +1044,7 @@ async def play_next(ctx):
             logger.debug(f"Format: {data.get('format_id')}, ext: {data.get('ext')}")
 
             source_init_start = time.perf_counter()
-            source = discord.FFmpegPCMAudio(filename, **settings.FFMPEG_OPTIONS)
+            source = LoggingFFmpegPCMAudio(filename, **settings.FFMPEG_OPTIONS)
             source_init_ms = int((time.perf_counter() - source_init_start) * 1000)
             log_playback_metric(
                 "source_created",
@@ -1028,7 +1058,7 @@ async def play_next(ctx):
         elif song['type'] == 'url':
             logger.debug(f"Creating FFmpeg source for generic URL: {song['data']}")
             source_init_start = time.perf_counter()
-            source = discord.FFmpegPCMAudio(
+            source = LoggingFFmpegPCMAudio(
                 song['data'],
                 **settings.FFMPEG_OPTIONS,
             )
@@ -1512,7 +1542,10 @@ async def stop(ctx):
         cancel_playback_monitor(ctx.guild.id)
     if ctx.voice_client:
         ctx.voice_client.stop()
-        await ctx.voice_client.disconnect()
+        try:
+            await asyncio.wait_for(ctx.voice_client.disconnect(force=True), timeout=5.0)
+        except Exception as e:
+            logger.warning("Stop disconnect timed out/failed: %s", e)
         await clear_bot_status_if_idle()
         await ctx.send("🛑 Stopped and disconnected.")
     else:

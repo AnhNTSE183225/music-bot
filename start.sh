@@ -66,6 +66,26 @@ if [ ! -f "$VENV_MARKER" ] || [ "$REQUIREMENTS_CHANGED" = true ] || [ "$DEPS_HEA
     echo -e "\e[32mOK: Dependencies installed\e[0m"
 fi
 
+if ! command -v node > /dev/null; then
+    if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" || "$OSTYPE" == "win32" ]]; then
+        NODE_EXE="./venv/Scripts/node.exe"
+        if [ ! -f "$NODE_EXE" ]; then
+            echo -e "\e[33mDownloading portable Node.js for yt-dlp JS challenges...\e[0m"
+            curl -sL -o "$NODE_EXE" "https://nodejs.org/dist/v20.11.1/win-x64/node.exe"
+            echo -e "\e[32mOK: Node.js downloaded\e[0m"
+        fi
+        export PATH="$PWD/venv/Scripts:$PATH"
+    else
+        NODE_DIR="./venv/node-v20.11.1-linux-x64"
+        if [ ! -d "$NODE_DIR" ]; then
+            echo -e "\e[33mDownloading portable Node.js for yt-dlp JS challenges...\e[0m"
+            curl -sL "https://nodejs.org/dist/v20.11.1/node-v20.11.1-linux-x64.tar.xz" | tar -xJ -C ./venv
+            echo -e "\e[32mOK: Node.js downloaded\e[0m"
+        fi
+        export PATH="$PWD/$NODE_DIR/bin:$PATH"
+    fi
+fi
+
 echo ""
 echo -e "\e[36mChecking for pip and yt-dlp updates...\e[0m"
 $VENV_PYTHON -m pip install -U pip yt-dlp

@@ -154,7 +154,7 @@ def get_ffmpeg_options():
     ffmpeg_cfg = _config.get('ffmpeg', {})
 
     return {
-        'before_options': ffmpeg_cfg.get('before_options', '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'),
+        'before_options': ffmpeg_cfg.get('before_options', '-v warning -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'),
         'options': ffmpeg_cfg.get('audio_only', '-vn'),
     }
 
