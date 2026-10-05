@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  musicbot:
+    build: .
+    image: musicbot:latest
+    container_name: musicbot
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # Map the data folders to persist queues and logs
+      - ./media:/app/media
+      - ./logs:/app/logs
+      - ./queue_state.json:/app/queue_state.json
+      # Pass through the config files
+      - ./config.yaml:/app/config.yaml
+    environment:
+      # Secrets should ideally be loaded from a .env file located next to docker-compose.yml
+      # Or you can hardcode them here if safe. The env_file directive below handles .env.
+      
+      # Overrides for production environment:
+      # Change these URLs to match your production domain where the UI is hosted
+      MUSICBOT_FRONTEND_URL: "https://your-production-domain.com"
+      MUSICBOT_DISCORD_REDIRECT_URI: "https://api.your-production-domain.com/callback"
+      
+      # Run in production mode
+      MUSICBOT_RUNTIME_MODE: "prod"
+      
+      # API Host / Port (0.0.0.0 is required in Docker)
+      MUSICBOT_API_HOST: "0.0.0.0"
+      MUSICBOT_API_PORT: "8000"
+      
+    # Load secrets like DISCORD_TOKEN, DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET
+    env_file:
+      - .env

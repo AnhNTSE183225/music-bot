@@ -30,12 +30,25 @@ load_dotenv()
 import settings
 
 # Configure logging with UTF-8 encoding to handle emoji and Unicode characters
+# Keep a global reference to the wrapper so it is never garbage collected,
+# which prevents its __del__ from automatically closing sys.stdout.buffer!
+_GLOBAL_UTF8_STREAM = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+
 # Create a UTF-8 stream wrapper for stdout to handle emoji
 class UTF8StreamHandler(logging.StreamHandler):
     def __init__(self):
-        # Use a UTF-8 text wrapper around stdout.buffer
-        utf8_stream = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-        super().__init__(utf8_stream)
+        super().__init__(_GLOBAL_UTF8_STREAM)
+        
+    def close(self):
+        # Override close to prevent closing sys.stdout when handlers are refreshed
+        self.acquire()
+        try:
+            if self.stream:
+                self.flush()
+            # Do not close the stream!
+        finally:
+            self.release()
+
 
 # Configure logging with custom UTF-8 handler
 logging.basicConfig(
@@ -1210,7 +1223,11 @@ def make_song(song_type, title, data, requester):
 
 
 def is_admin_member(member):
-    """Return True if the Discord member has Administrator permission."""
+    """Return True if the Discord member has Administrator permission or is the bot owner."""
+    if member is None:
+        return False
+    if settings.CONSOLE_USER_ID and member.id == settings.CONSOLE_USER_ID:
+        return True
     return bool(getattr(member.guild_permissions, 'administrator', False))
 
 
@@ -2654,6 +2671,29 @@ async def clear(ctx):
     if ctx.guild:
         clear_votes(ctx.guild.id)
     await ctx.send("🗑️ **Playlist cleared.**")
+@bot.command()
+async def pause(ctx):
+    """Pauses the current playing song."""
+    if not await enforce_command_access(ctx, 'pause'):
+        return
+
+    if ctx.voice_client and ctx.voice_client.is_playing():
+        ctx.voice_client.pause()
+        await ctx.send("⏸️ **Paused**")
+    else:
+        await ctx.send("❌ Nothing is playing to pause.")
+
+@bot.command()
+async def resume(ctx):
+    """Resumes the paused song."""
+    if not await enforce_command_access(ctx, 'resume'):
+        return
+
+    if ctx.voice_client and ctx.voice_client.is_paused():
+        ctx.voice_client.resume()
+        await ctx.send("▶️ **Resumed**")
+    else:
+        await ctx.send("❌ Nothing is paused.")
 
 @bot.command()
 async def stop(ctx):
@@ -2955,6 +2995,16 @@ async def setup_hook():
         _blacklist_patterns = load_yt_blacklist_patterns()
         ensure_loop_lag_monitor()
         load_state_from_disk()
+        
+        # Start API server
+        try:
+            import api
+            api.set_bot(bot)
+            api.start_api_server(host=getattr(settings, "API_HOST", "0.0.0.0"), port=getattr(settings, "API_PORT", 8000))
+            logger.info("API Server started successfully.")
+        except Exception as api_err:
+            logger.error(f"Failed to start API server: {api_err}", exc_info=True)
+
         logger.info(f"Initialized with {len(_blacklist_patterns)} blacklist patterns and persistent queue state.")
     except Exception as e:
         logger.error(f"Failed to initialize during setup_hook: {e}", exc_info=True)

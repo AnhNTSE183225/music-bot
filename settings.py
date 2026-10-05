@@ -375,3 +375,9 @@ def get_skip_vote_config():
 
 
 validate_permissions_identity_lists()
+
+# --- API & Web UI Settings ---
+API_HOST = os.getenv('MUSICBOT_API_HOST', _config.get('api', {}).get('host', '0.0.0.0'))
+API_PORT = int(os.getenv('MUSICBOT_API_PORT', _config.get('api', {}).get('port', 8000)))
+FRONTEND_URL = os.getenv('MUSICBOT_FRONTEND_URL', _config.get('api', {}).get('frontend_url', 'http://localhost:3000'))
+DISCORD_REDIRECT_URI = os.getenv('MUSICBOT_DISCORD_REDIRECT_URI', _config.get('api', {}).get('discord_redirect_uri', 'http://localhost:8000/callback'))

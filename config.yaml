@@ -137,6 +137,12 @@ permissions:
     stop:
       mode: "open"
 
+    pause:
+      mode: "admin_only"
+
+    resume:
+      mode: "admin_only"
+
     volume:
       mode: "admin_only"
 
@@ -160,3 +166,10 @@ permissions:
 
     normalize:
       mode: "admin_only"
+
+# API & Web UI Settings
+api:
+  host: "0.0.0.0"
+  port: 8000
+  frontend_url: "http://localhost:3000"
+  discord_redirect_uri: "http://localhost:8000/callback"

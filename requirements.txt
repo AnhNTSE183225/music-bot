@@ -10,3 +10,8 @@ python-dotenv
 # YAML configuration parsing
 PyYAML
 ruamel.yaml
+
+# API server and HTTP requests
+fastapi
+uvicorn
+httpx
