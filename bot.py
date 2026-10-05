@@ -8,14 +8,22 @@ import threading
 import yt_dlp
 import difflib
 import re
+import json
 from dotenv import load_dotenv
 import logging
 import importlib
 import math
 import time
 import shlex
-from datetime import datetime, timedelta, timezone
-from yt_query_logic import is_probable_url, is_youtube_link, normalize_yt_search_term
+from yt_query_logic import (
+    build_yt_music_search_url,
+    format_duration,
+    is_probable_url,
+    is_youtube_link,
+    normalize_yt_search_term,
+    parse_youtube_url,
+    sanitize_query,
+)
 
 load_dotenv()
 
@@ -56,15 +64,13 @@ import threading
 
 class LoggingFFmpegPCMAudio(discord.FFmpegPCMAudio):
     def __init__(self, *args, **kwargs):
-        # We need to capture stderr. FFmpegPCMAudio uses subprocess.Popen.
-        # So we pass stderr=subprocess.PIPE to it.
-        kwargs['stderr'] = subprocess.PIPE
+        kwargs.pop('stderr', None)
         super().__init__(*args, **kwargs)
         
-        # Now self._process is the Popen object
-        self._stderr_thread = threading.Thread(target=self._log_stderr)
-        self._stderr_thread.daemon = True
-        self._stderr_thread.start()
+        # Start stderr reader thread if stderr pipe is available
+        if hasattr(self, '_process') and self._process and getattr(self._process, 'stderr', None):
+            self._stderr_thread = threading.Thread(target=self._log_stderr, daemon=True)
+            self._stderr_thread.start()
 
     def _log_stderr(self):
         if hasattr(self, '_process') and self._process and self._process.stderr:
@@ -84,14 +90,14 @@ if settings.CONSOLE_USER_ID is not None:
     bot.owner_id = settings.CONSOLE_USER_ID
 
 ytdl = yt_dlp.YoutubeDL(settings.YTDL_OPTIONS)
-search_ytdl_options = dict(settings.YTDL_OPTIONS)
-search_ytdl_options['ignoreerrors'] = True
-search_ytdl = yt_dlp.YoutubeDL(search_ytdl_options)
+search_ytdl = yt_dlp.YoutubeDL(getattr(settings, 'SEARCH_YTDL_OPTIONS', settings.YTDL_OPTIONS))
+playlist_ytdl = yt_dlp.YoutubeDL(settings.PLAYLIST_YTDL_OPTIONS)
 
 # GLOBAL VARIABLES
 music_state_by_guild = {}
 play_next_locks_by_guild = {}
 votes_by_guild = {}
+active_playlist_prompts_by_guild = {}
 next_queue_id = 1
 empty_voice_leave_tasks = {}
 EMPTY_VOICE_LEAVE_DELAY_SECONDS = 10
@@ -102,6 +108,22 @@ console_input_thread = None
 console_input_thread_stop = None
 console_command_consumer_task = None
 console_command_bridge_started = False
+voice_recovery_tasks = {}
+
+
+def cancel_pending_playlist_prompt(guild_id):
+    """Cancel and disable any active playlist append prompt for this guild."""
+    if guild_id is None:
+        return
+    old_view = active_playlist_prompts_by_guild.pop(guild_id, None)
+    if old_view and not old_view.is_finished():
+        old_view.disable_all_items()
+        old_view.stop()
+        if old_view.message:
+            try:
+                asyncio.create_task(old_view.on_overridden())
+            except Exception:
+                pass
 
 # Cache blacklist patterns at module level (load once on startup)
 _blacklist_patterns = []
@@ -125,6 +147,8 @@ def load_yt_blacklist_patterns():
             logger.warning(f"Invalid regex pattern in config: {raw_pattern} ({e})")
     
     return patterns
+
+_blacklist_patterns = load_yt_blacklist_patterns()
 
 def is_blacklisted_title(title):
     """Return True if the title matches any blacklist regex pattern (uses cached patterns)."""
@@ -161,9 +185,145 @@ def get_music_state(guild):
             'loop_enabled': False,
             'current_song': None,
             'volume': settings.DEFAULT_VOLUME,
+            'voice_channel_id': None,
+            'text_channel_id': None,
+            'is_playing': False,
+            'was_playing': False,
+            'manual_stop': False,
+            'saved_at': time.time(),
         }
         music_state_by_guild[guild_id] = state
     return state
+
+
+def save_state_to_disk():
+    """Atomically save persistent music states to disk."""
+    state_path = getattr(settings, 'STATE_FILE', None)
+    if not state_path:
+        return
+
+    try:
+        data_to_save = {}
+        for guild_id, state in music_state_by_guild.items():
+            queue = state.get('queue', [])
+            if not queue and state.get('queue_index', -1) == -1 and not state.get('voice_channel_id'):
+                continue
+
+            serializable_queue = []
+            for s in queue:
+                serializable_queue.append({
+                    'queue_id': s.get('queue_id'),
+                    'type': s.get('type'),
+                    'title': s.get('title'),
+                    'data': s.get('data'),
+                    'duration': s.get('duration'),
+                    'requester_id': s.get('requester_id'),
+                    'requester_mention': s.get('requester_mention'),
+                    'requester_handle': s.get('requester_handle'),
+                })
+
+            manual_stop = bool(state.get('manual_stop', False))
+            is_playing = False if manual_stop else bool(state.get('current_song') or state.get('is_playing', False))
+            saved_at = float(state.get('saved_at') or time.time())
+
+            data_to_save[str(guild_id)] = {
+                'queue': serializable_queue,
+                'queue_index': state.get('queue_index', -1),
+                'loop_enabled': state.get('loop_enabled', False),
+                'volume': state.get('volume', settings.DEFAULT_VOLUME),
+                'voice_channel_id': None if manual_stop else state.get('voice_channel_id'),
+                'text_channel_id': state.get('text_channel_id'),
+                'is_playing': is_playing,
+                'manual_stop': manual_stop,
+                'saved_at': saved_at,
+            }
+
+        parent_dir = os.path.dirname(state_path)
+        if parent_dir and not os.path.exists(parent_dir):
+            os.makedirs(parent_dir, exist_ok=True)
+
+        temp_path = f"{state_path}.tmp"
+        with open(temp_path, 'w', encoding='utf-8') as f:
+            json.dump(data_to_save, f, indent=2, ensure_ascii=False)
+        os.replace(temp_path, state_path)
+        logger.debug("Saved queue state to %s (%d guilds)", state_path, len(data_to_save))
+    except Exception as e:
+        logger.warning(f"Failed to save queue state: {e}")
+
+
+def load_state_from_disk():
+    """Load persistent music states from disk on startup."""
+    global next_queue_id
+    state_path = getattr(settings, 'STATE_FILE', None)
+    if not state_path or not os.path.exists(state_path):
+        return
+
+    try:
+        with open(state_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        if not isinstance(data, dict):
+            return
+
+        max_qid = next_queue_id
+        now = time.time()
+        max_age = getattr(settings, 'AUTO_RESUME_MAX_AGE_SECONDS', 300)
+
+        for guild_id_str, g_state in data.items():
+            try:
+                guild_id = int(guild_id_str)
+            except ValueError:
+                continue
+
+            queue = g_state.get('queue', [])
+            for s in queue:
+                s['enqueued_perf'] = time.perf_counter()
+                qid = s.get('queue_id', 0)
+                if qid >= max_qid:
+                    max_qid = qid + 1
+
+            saved_at = float(g_state.get('saved_at', 0))
+            is_stale = (saved_at <= 0) or ((now - saved_at) > max_age)
+            manual_stop = bool(g_state.get('manual_stop', False))
+            was_playing = bool(g_state.get('is_playing', False))
+
+            if manual_stop or is_stale:
+                was_playing = False
+                voice_channel_id = None
+                manual_stop = True
+            else:
+                voice_channel_id = g_state.get('voice_channel_id')
+
+            music_state_by_guild[guild_id] = {
+                'queue': queue,
+                'queue_index': g_state.get('queue_index', -1),
+                'loop_enabled': g_state.get('loop_enabled', False),
+                'current_song': None,
+                'volume': g_state.get('volume', settings.DEFAULT_VOLUME),
+                'voice_channel_id': voice_channel_id,
+                'text_channel_id': g_state.get('text_channel_id'),
+                'is_playing': False,
+                'was_playing': was_playing,
+                'manual_stop': manual_stop,
+                'saved_at': saved_at if saved_at > 0 else now,
+            }
+
+        next_queue_id = max(next_queue_id, max_qid)
+        logger.info(f"Loaded persistent music state for {len(music_state_by_guild)} guild(s) from {state_path}")
+    except Exception as e:
+        logger.warning(f"Failed to load persistent queue state from {state_path}: {e}")
+
+
+def update_music_state_channels(guild, voice_channel=None, text_channel=None):
+    """Save active channel IDs for voice auto-reconnect."""
+    state = get_music_state(guild)
+    if state is not None:
+        if voice_channel is not None:
+            state['voice_channel_id'] = getattr(voice_channel, 'id', None)
+            state['manual_stop'] = False
+        if text_channel is not None:
+            state['text_channel_id'] = getattr(text_channel, 'id', None)
+        save_state_to_disk()
 
 
 def get_music_queue(guild):
@@ -191,14 +351,242 @@ def set_music_volume(guild, volume):
     state = get_music_state(guild)
     if state is not None:
         state['volume'] = volume
+        save_state_to_disk()
 
 
 def clear_music_state(guild):
+    guild_id = getattr(guild, 'id', None)
+    if guild_id:
+        cancel_voice_recovery(guild_id)
     state = get_music_state(guild)
     if state is not None:
         state['queue'].clear()
         state['queue_index'] = -1
         state['current_song'] = None
+        state['is_playing'] = False
+        state['was_playing'] = False
+        state['voice_channel_id'] = None
+        state['text_channel_id'] = None
+        state['manual_stop'] = True
+        state['saved_at'] = time.time()
+        save_state_to_disk()
+
+
+def cancel_voice_recovery(guild_id):
+    """Cancel pending voice recovery task for a guild if active."""
+    if guild_id is None:
+        return
+    task = voice_recovery_tasks.pop(guild_id, None)
+    if task and not task.done():
+        task.cancel()
+
+
+def get_channel_listener_count(channel):
+    """Count non-bot members in a voice channel."""
+    if not channel:
+        return 0
+    return sum(1 for member in getattr(channel, 'members', []) if not getattr(member, 'bot', False))
+
+
+def get_non_bot_voice_member_count(voice_client):
+    """Count non-bot users in the bot's current voice channel."""
+    if not voice_client or not voice_client.channel:
+        return 0
+    return get_channel_listener_count(voice_client.channel)
+
+
+class MusicContext:
+    """Lightweight context used for background playback resumption and auto-reconnect."""
+
+    def __init__(self, bot, guild, channel=None, author=None):
+        self.bot = bot
+        self.guild = guild
+        self.channel = channel or ConsoleChannel(guild.name if guild else "console")
+        self.author = author or getattr(guild, 'me', None)
+        self.message = None
+
+    @property
+    def voice_client(self):
+        return getattr(self.guild, 'voice_client', None) if self.guild else None
+
+    async def send(self, content=None, **kwargs):
+        if self.channel:
+            try:
+                return await self.channel.send(content, **kwargs)
+            except Exception as e:
+                logger.warning(f"Failed to send context message: {e}")
+        return None
+
+
+def ensure_voice_recovery_task(guild_id, ctx=None):
+    """Start a background task to reconnect to voice and resume playback if disconnected."""
+    if not settings.AUTO_RECONNECT or not settings.AUTO_RESUME_PLAYBACK:
+        return
+    if bot.is_closed():
+        return
+
+    state = music_state_by_guild.get(guild_id)
+    if not state or state.get('manual_stop') or not state.get('voice_channel_id'):
+        return
+    if not state.get('queue') and not state.get('is_playing'):
+        return
+
+    existing = voice_recovery_tasks.get(guild_id)
+    if existing and not existing.done():
+        return
+
+    async def recover():
+        attempts = 0
+        max_attempts = settings.VOICE_RECONNECT_ATTEMPTS
+        interval = settings.VOICE_RECONNECT_INTERVAL
+        state = music_state_by_guild.get(guild_id)
+        if not state or state.get('manual_stop') or not state.get('voice_channel_id'):
+            return
+
+        voice_channel_id = state.get('voice_channel_id')
+        logger.info(f"Voice recovery initiated for guild {guild_id} (channel {voice_channel_id}).")
+
+        while attempts < max_attempts:
+            attempts += 1
+            try:
+                await asyncio.sleep(interval)
+                if bot.is_closed():
+                    return
+                current_state = music_state_by_guild.get(guild_id)
+                if not current_state or current_state.get('manual_stop'):
+                    logger.info(f"Aborting voice recovery for guild {guild_id}: manual stop requested.")
+                    return
+
+                guild = bot.get_guild(guild_id)
+                if not guild:
+                    continue
+
+                voice_channel = guild.get_channel(voice_channel_id)
+                if not voice_channel:
+                    continue
+
+                # Abort if no human listeners are in the voice channel
+                if get_channel_listener_count(voice_channel) == 0:
+                    logger.info(f"Aborting voice recovery for guild {guild_id}: no human listeners in {voice_channel.name}.")
+                    return
+
+                if guild.voice_client and guild.voice_client.is_connected():
+                    if guild.voice_client.is_playing() or guild.voice_client.is_paused():
+                        break
+                    active_ctx = ctx or MusicContext(bot=bot, guild=guild, channel=guild.get_channel(current_state.get('text_channel_id')))
+                    async with get_play_next_lock(guild_id):
+                        await play_next(active_ctx)
+                    break
+
+                if guild.voice_client:
+                    try:
+                        await guild.voice_client.disconnect(force=True)
+                    except Exception:
+                        pass
+
+                vc = await voice_channel.connect(timeout=settings.CONNECTION_TIMEOUT, reconnect=True)
+                if guild is not None:
+                    try:
+                        guild.voice_client = vc
+                    except (AttributeError, TypeError):
+                        pass
+                await asyncio.sleep(settings.CONNECTION_STABILIZE_DELAY)
+                logger.info(f"Voice recovery succeeded for guild {guild.name} ({guild_id}) on attempt {attempts}!")
+
+                text_ch = guild.get_channel(current_state.get('text_channel_id')) if current_state and current_state.get('text_channel_id') else None
+                active_ctx = ctx or MusicContext(bot=bot, guild=guild, channel=text_ch)
+                if text_ch:
+                    await text_ch.send(f"🔄 **Voice connection restored ({voice_channel.name})!** Resuming playlist...")
+
+                async with get_play_next_lock(guild_id):
+                    st = get_music_state(guild)
+                    if st and st.get('queue'):
+                        curr_idx = st.get('queue_index', -1)
+                        if curr_idx >= 0:
+                            st['queue_index'] = curr_idx - 1
+                        await play_next(active_ctx)
+                break
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.debug(f"Voice recovery attempt {attempts}/{max_attempts} for guild {guild_id} failed: {e}")
+
+        voice_recovery_tasks.pop(guild_id, None)
+
+    voice_recovery_tasks[guild_id] = asyncio.create_task(recover())
+
+
+async def check_and_resume_all_sessions():
+    """Check restored guild states after reconnect and resume playback if active."""
+    now = time.time()
+    max_age = getattr(settings, 'AUTO_RESUME_MAX_AGE_SECONDS', 300)
+
+    for guild_id, state in list(music_state_by_guild.items()):
+        try:
+            if state.get('manual_stop', False):
+                continue
+
+            saved_at = float(state.get('saved_at', 0))
+            if saved_at <= 0 or (now - saved_at) > max_age:
+                continue
+
+            voice_channel_id = state.get('voice_channel_id')
+            queue = state.get('queue', [])
+            was_playing = state.get('was_playing', False) or state.get('is_playing', False)
+
+            if not queue or not was_playing or not voice_channel_id:
+                continue
+
+            guild = bot.get_guild(guild_id)
+            if not guild:
+                continue
+
+            voice_channel = guild.get_channel(voice_channel_id)
+            if not voice_channel:
+                continue
+
+            # Only auto-resume if there are active listeners in that voice channel
+            if get_channel_listener_count(voice_channel) == 0:
+                logger.info(
+                    "Skipping auto-resume for guild %s (%s): no human listeners in voice channel %s.",
+                    guild.name, guild_id, voice_channel.name
+                )
+                continue
+
+            if guild.voice_client and (guild.voice_client.is_playing() or guild.voice_client.is_paused()):
+                continue
+
+            text_channel = guild.get_channel(state.get('text_channel_id')) if state.get('text_channel_id') else None
+            ctx = MusicContext(bot=bot, guild=guild, channel=text_channel)
+
+            logger.info(f"Auto-resuming session for guild {guild.name} ({guild_id}) in voice channel {voice_channel.name}...")
+
+            if guild.voice_client:
+                try:
+                    await guild.voice_client.disconnect(force=True)
+                except Exception:
+                    pass
+
+            vc = await voice_channel.connect(timeout=settings.CONNECTION_TIMEOUT, reconnect=True)
+            if guild is not None:
+                try:
+                    guild.voice_client = vc
+                except (AttributeError, TypeError):
+                    pass
+            await asyncio.sleep(settings.CONNECTION_STABILIZE_DELAY)
+
+            async with get_play_next_lock(guild_id):
+                curr_idx = state.get('queue_index', -1)
+                if curr_idx >= 0:
+                    state['queue_index'] = curr_idx - 1
+                await play_next(ctx)
+
+            if text_channel:
+                await text_channel.send(
+                    f"🔄 **Restored session ({voice_channel.name})!** Resuming playlist ({len(queue)} tracks in queue)."
+                )
+        except Exception as e:
+            logger.warning(f"Failed to auto-resume session for guild {guild_id}: {e}")
 
 
 def any_music_playing():
@@ -218,6 +606,35 @@ def get_play_next_lock(guild_id):
     return lock
 
 
+class ConsoleMessage:
+    """Minimal message object returned by ConsoleChannel.send."""
+
+    def __init__(self, content="", author=None, guild=None, channel=None):
+        self.content = content
+        self.author = author
+        self.guild = guild
+        self.channel = channel
+        self.attachments = []
+        self.reference = None
+        self.id = int(time.time() * 1000)
+
+    async def edit(self, content=None, **kwargs):
+        if content is None and 'embed' in kwargs:
+            embed = kwargs['embed']
+            parts = []
+            if getattr(embed, 'title', None):
+                parts.append(f"**{embed.title}**")
+            if getattr(embed, 'description', None):
+                parts.append(embed.description)
+            if getattr(embed, 'footer', None) and getattr(embed.footer, 'text', None):
+                parts.append(f"[{embed.footer.text}]")
+            content = "\n".join(parts) if parts else str(embed)
+        if content is not None:
+            label = getattr(self.channel, 'label', 'console')
+            print(f"[{label}] {content}")
+        return self
+
+
 class ConsoleChannel:
     """Minimal channel adapter that prints command responses to stdout."""
 
@@ -228,10 +645,18 @@ class ConsoleChannel:
         if content is None:
             content = kwargs.get('content')
         if content is None and 'embed' in kwargs:
-            content = str(kwargs['embed'])
+            embed = kwargs['embed']
+            parts = []
+            if getattr(embed, 'title', None):
+                parts.append(f"**{embed.title}**")
+            if getattr(embed, 'description', None):
+                parts.append(embed.description)
+            if getattr(embed, 'footer', None) and getattr(embed.footer, 'text', None):
+                parts.append(f"[{embed.footer.text}]")
+            content = "\n".join(parts) if parts else str(embed)
         if content is not None:
             print(f"[{self.label}] {content}")
-        return None
+        return ConsoleMessage(content=content, channel=self)
 
 
 class ConsoleAuthor:
@@ -383,10 +808,12 @@ async def dispatch_console_command(raw_line):
     ctx.send = send
 
     async def run_command():
-        if command_name in {'play', 'yt', 'blacklist'}:
+        if command_name in {'play', 'yt', 'playlist', 'pl', 'blacklist'}:
             query = command_line[len(command_name):].strip()
             if command_name == 'blacklist':
                 await command.callback(ctx, pattern=(query or None))
+            elif command_name in {'playlist', 'pl'}:
+                await command.callback(ctx, query=(query or None))
             else:
                 if not query:
                     await ctx.send(f"❌ Usage: {prefix}{command_name} <query>")
@@ -404,6 +831,18 @@ async def dispatch_console_command(raw_line):
                 await ctx.send(f"❌ `{parts[1]}` is not a valid number.")
                 return
             await command.callback(ctx, value)
+            return
+
+        if command_name in {'queue', 'q'}:
+            if len(parts) >= 2:
+                try:
+                    page_val = int(parts[1])
+                except ValueError:
+                    await ctx.send(f"❌ `{parts[1]}` is not a valid number.")
+                    return
+                await command.callback(ctx, page=page_val)
+            else:
+                await command.callback(ctx)
             return
 
         if command_name in {'block', 'unblock', 'whitelist', 'unwhitelist'}:
@@ -448,10 +887,16 @@ def start_console_command_bridge():
         logger.info("Console command bridge disabled. Set USER_ID in .env to enable it.")
         return
 
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        logger.warning("No running asyncio loop found for console bridge.")
+        return
+
     console_command_bridge_started = True
     console_command_queue = asyncio.Queue()
     console_input_thread_stop = threading.Event()
-    console_command_consumer_task = bot.loop.create_task(consume_console_commands())
+    console_command_consumer_task = asyncio.create_task(consume_console_commands())
 
     def reader():
         try:
@@ -465,10 +910,11 @@ def start_console_command_bridge():
                     if not raw_line.strip():
                         continue
 
-                    try:
-                        asyncio.run_coroutine_threadsafe(console_command_queue.put(raw_line), bot.loop)
-                    except RuntimeError:
-                        break
+                    if current_loop and current_loop.is_running():
+                        try:
+                            asyncio.run_coroutine_threadsafe(console_command_queue.put(raw_line), current_loop)
+                        except RuntimeError:
+                            break
                 except (EOFError, ValueError):
                     # stdin closed or other readline error
                     break
@@ -556,7 +1002,7 @@ def start_playback_monitor(ctx, song, playback_started_perf):
         finally:
             playback_monitor_tasks.pop(guild_id, None)
 
-    playback_monitor_tasks[guild_id] = bot.loop.create_task(monitor())
+    playback_monitor_tasks[guild_id] = asyncio.create_task(monitor())
 
 
 def ensure_loop_lag_monitor():
@@ -577,7 +1023,7 @@ def ensure_loop_lag_monitor():
                 log_playback_metric("event_loop_lag", lag_ms=lag_ms)
             expected = now + interval
 
-    loop_lag_monitor_task = bot.loop.create_task(monitor_loop_lag())
+    loop_lag_monitor_task = asyncio.create_task(monitor_loop_lag())
 
 async def update_bot_status(song_title):
     """Update bot's status to show currently playing song."""
@@ -620,16 +1066,42 @@ def find_best_match(query):
 
 
 async def get_playable_search_result(search_term, max_results=10):
-    """Resolve a search term to the first playable YouTube result.
+    """Resolve a search term to the first playable result.
 
-    Uses ignoreerrors for search listing so restricted/unavailable results are skipped,
-    then validates each candidate with the main yt-dlp options.
+    Searches YouTube Music by default (or standard YouTube if configured/as fallback).
+    Uses ignoreerrors and flat extraction for search listing so restricted/unavailable results
+    are skipped quickly, then validates each candidate with the main yt-dlp options.
     """
-    search_expr = f"ytsearch{max_results}:{search_term}"
-    data = await asyncio.to_thread(search_ytdl.extract_info, search_expr, False)
+    search_provider = getattr(settings, 'YOUTUBE_SEARCH_PROVIDER', 'youtube_music')
     entries = []
-    if data and isinstance(data, dict):
-        entries = data.get('entries') or []
+    is_ytm = (search_provider == 'youtube_music')
+
+    if is_ytm:
+        music_url = build_yt_music_search_url(search_term)
+        try:
+            data = await asyncio.to_thread(search_ytdl.extract_info, music_url, False)
+            raw_entries = (data.get('entries') or []) if isinstance(data, dict) else []
+            for e in raw_entries:
+                if not e:
+                    continue
+                u = e.get('url') or e.get('webpage_url') or ''
+                # Skip browse cards (artists, albums, channels) and keep watch URLs / IDs
+                if '/browse/' in u:
+                    continue
+                if 'watch?v=' in u or 'youtu.be/' in u or e.get('id'):
+                    entries.append(e)
+        except Exception as exc:
+            logger.warning("YouTube Music search failed for '%s': %s. Falling back to standard YouTube.", search_term, exc)
+            entries = []
+
+    # If YouTube Music returned no playable tracks or standard YouTube is selected, fallback/search standard YouTube
+    if not entries:
+        if is_ytm:
+            logger.info("No candidates from YouTube Music search for '%s', falling back to ytsearch.", search_term)
+        search_expr = f"ytsearch{max_results}:{search_term}"
+        data = await asyncio.to_thread(search_ytdl.extract_info, search_expr, False)
+        if data and isinstance(data, dict):
+            entries = data.get('entries') or []
 
     skip_count = 0
     last_error = None
@@ -646,7 +1118,7 @@ async def get_playable_search_result(search_term, max_results=10):
             continue
 
         candidate_url = entry.get('webpage_url') or entry.get('url')
-        if not candidate_url:
+        if not candidate_url or '/browse/' in candidate_url:
             skip_count += 1
             continue
 
@@ -673,6 +1145,10 @@ async def get_playable_search_result(search_term, max_results=10):
             skip_count += 1
             continue
 
+        # If candidate originated from YouTube Music, ensure the webpage URL reflects it
+        if candidate_url.startswith('https://music.youtube.com'):
+            candidate_data['music_url'] = candidate_url
+
         return candidate_data, skip_count
 
     if last_error:
@@ -682,6 +1158,9 @@ async def get_playable_search_result(search_term, max_results=10):
 
 async def ensure_voice_connected(ctx):
     """Ensure bot is connected to user's voice channel. Returns True on success."""
+    if ctx.author.voice and ctx.author.voice.channel:
+        update_music_state_channels(ctx.guild, voice_channel=ctx.author.voice.channel, text_channel=getattr(ctx, 'channel', None))
+
     if ctx.voice_client and ctx.voice_client.is_connected():
         return True
     
@@ -705,6 +1184,7 @@ async def ensure_voice_connected(ctx):
             elapsed_ms=int(elapsed * 1000),
             stabilize_delay_ms=int(settings.CONNECTION_STABILIZE_DELAY * 1000),
         )
+        update_music_state_channels(ctx.guild, voice_channel=ctx.author.voice.channel, text_channel=getattr(ctx, 'channel', None))
         return True
     except Exception as e:
         logger.error(f"Failed to connect to voice channel: {e}")
@@ -842,6 +1322,15 @@ def ensure_empty_voice_leave_timer(guild):
             if fresh_voice_client.is_playing() or fresh_voice_client.is_paused():
                 return
 
+            state = get_music_state(guild)
+            if state:
+                state['manual_stop'] = True
+                state['is_playing'] = False
+                state['was_playing'] = False
+                state['voice_channel_id'] = None
+                state['text_channel_id'] = None
+                state['saved_at'] = time.time()
+            cancel_voice_recovery(guild_id)
             clear_music_state(guild)
             clear_votes(guild_id)
             fresh_voice_client.stop()
@@ -849,6 +1338,7 @@ def ensure_empty_voice_leave_timer(guild):
                 await asyncio.wait_for(fresh_voice_client.disconnect(force=True), timeout=5.0)
             except Exception as e:
                 logger.warning("Voice disconnect timed out/failed: %s", e)
+            cancel_voice_recovery(guild_id)
             await clear_bot_status_if_idle()
             logger.info(
                 "Disconnected from voice in guild %s after %s seconds with no listeners.",
@@ -862,7 +1352,7 @@ def ensure_empty_voice_leave_timer(guild):
         finally:
             empty_voice_leave_tasks.pop(guild_id, None)
 
-    empty_voice_leave_tasks[guild_id] = bot.loop.create_task(leave_if_still_empty())
+    empty_voice_leave_tasks[guild_id] = asyncio.create_task(leave_if_still_empty())
 
 
 def get_skip_vote_eligible_members(ctx, same_channel_only):
@@ -953,6 +1443,8 @@ async def play_next(ctx):
     if not queue:
         music_state['current_song'] = None
         music_state['queue_index'] = -1
+        music_state['is_playing'] = False
+        save_state_to_disk()
         await clear_bot_status_if_idle()
         return
 
@@ -967,6 +1459,8 @@ async def play_next(ctx):
             next_idx = 0
         else:
             music_state['current_song'] = None
+            music_state['is_playing'] = False
+            save_state_to_disk()
             await clear_bot_status_if_idle()
             return
 
@@ -976,6 +1470,9 @@ async def play_next(ctx):
     music_state['queue_index'] = next_idx
     song = queue[next_idx]
     music_state['current_song'] = song  # Track currently playing song
+    music_state['is_playing'] = True
+    music_state['manual_stop'] = False
+    save_state_to_disk()
     queue_wait_ms = int((time.perf_counter() - song.get('enqueued_perf', time.perf_counter())) * 1000)
 
     try:
@@ -984,7 +1481,7 @@ async def play_next(ctx):
         if song['type'] == 'local':
             source_path = os.path.join(settings.MEDIA_FOLDER, song['data'])
             source_init_start = time.perf_counter()
-            source = LoggingFFmpegPCMAudio(source_path)
+            source = LoggingFFmpegPCMAudio(source_path, **getattr(settings, 'LOCAL_FFMPEG_OPTIONS', {}))
             source_init_ms = int((time.perf_counter() - source_init_start) * 1000)
             log_playback_metric(
                 "source_created",
@@ -1086,6 +1583,7 @@ async def play_next(ctx):
 
             playback_started = time.perf_counter()
             start_playback_monitor(ctx, song, playback_started)
+            current_loop = asyncio.get_running_loop()
 
             def after_playback(error):
                 """Called after playback ends. Schedules next song with proper lock protection."""
@@ -1117,10 +1615,18 @@ async def play_next(ctx):
                                 queue_id=song.get('queue_id'),
                                 wait_ms=lock_wait_ms,
                             )
+                        current_state = get_music_state(ctx.guild)
+                        if not current_state or current_state.get('manual_stop') or bot.is_closed():
+                            return
+
                         if ctx.voice_client and ctx.voice_client.is_connected():
                             await play_next(ctx)
+                        elif ctx.guild and settings.AUTO_RECONNECT:
+                            if current_state.get('queue') or current_state.get('is_playing'):
+                                logger.warning(f"Voice client lost connection in guild {ctx.guild.id}. Starting voice recovery...")
+                                ensure_voice_recovery_task(ctx.guild.id, ctx)
 
-                future = asyncio.run_coroutine_threadsafe(next_with_lock(), bot.loop)
+                future = asyncio.run_coroutine_threadsafe(next_with_lock(), current_loop)
 
                 def _on_future_done(done_future):
                     try:
@@ -1154,15 +1660,22 @@ async def play_next(ctx):
             logger.warning("Lost connection before playing")
             queue.insert(0, song)  # Put song back in queue
             await ctx.send("❌ Lost voice connection")
+            current_state = get_music_state(ctx.guild)
+            if ctx.guild and settings.AUTO_RECONNECT and current_state and not current_state.get('manual_stop') and not bot.is_closed():
+                ensure_voice_recovery_task(ctx.guild.id, ctx)
 
     except Exception as e:
         logger.error(f"Error in play_next: {e}", exc_info=True)
         await ctx.send(f"❌ Error playing: {e}")
         # Try next song after a small delay
         await asyncio.sleep(1)
-        if ctx.voice_client and ctx.voice_client.is_connected():
-            async with get_play_next_lock(getattr(ctx.guild, 'id', None)):
-                await play_next(ctx)
+        current_state = get_music_state(ctx.guild)
+        if current_state and not current_state.get('manual_stop') and not bot.is_closed():
+            if ctx.voice_client and ctx.voice_client.is_connected():
+                async with get_play_next_lock(getattr(ctx.guild, 'id', None)):
+                    await play_next(ctx)
+            elif ctx.guild and settings.AUTO_RECONNECT:
+                ensure_voice_recovery_task(ctx.guild.id, ctx)
 
 # --- EVENTS ---
 
@@ -1170,6 +1683,14 @@ async def play_next(ctx):
 async def on_ready():
     logger.info(f'Logged in as {bot.user}')
     start_console_command_bridge()
+    if settings.AUTO_RESUME_PLAYBACK:
+        await check_and_resume_all_sessions()
+
+@bot.event
+async def on_resumed():
+    logger.info('Gateway session resumed.')
+    if settings.AUTO_RESUME_PLAYBACK:
+        await check_and_resume_all_sessions()
 
 @bot.event
 async def on_command_error(ctx, error):
@@ -1204,6 +1725,10 @@ async def join(ctx):
     """Joins the user's voice channel."""
     if ctx.author.voice:
         channel = ctx.author.voice.channel
+        state = get_music_state(ctx.guild)
+        if state:
+            state['manual_stop'] = False
+        update_music_state_channels(ctx.guild, voice_channel=channel, text_channel=getattr(ctx, 'channel', None))
         if ctx.voice_client:
             await ctx.voice_client.move_to(channel)
             await ctx.send(f"🔄 Moved to **{channel}**")
@@ -1247,12 +1772,320 @@ async def play(ctx, *, query):
     song_obj = make_song('local', filename, filename, ctx.author)
     queue = get_music_queue(ctx.guild)
     queue.append(song_obj)
+    save_state_to_disk()
 
     async with get_play_next_lock(getattr(ctx.guild, 'id', None)):
         if not ctx.voice_client.is_playing():
             await play_next(ctx)
         else:
             await ctx.send(f"✅ Added to queue: `{filename}` (added by {ctx.author.mention})")
+
+class PlaylistAppendView(discord.ui.View):
+    """Interactive Discord UI View prompting if the user wants to add remaining playlist tracks."""
+
+    def __init__(self, author_id, guild_id, playlist_title, remaining_entries, ctx, timeout=None):
+        if timeout is None:
+            timeout = settings.PLAYLIST_CONFIRMATION_TIMEOUT
+        super().__init__(timeout=timeout)
+        self.author_id = author_id
+        self.guild_id = guild_id
+        self.playlist_title = playlist_title
+        self.remaining_entries = remaining_entries
+        self.ctx = ctx
+        self.message = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "❌ Only the person who requested this song can add the playlist.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Add Remaining Playlist", style=discord.ButtonStyle.success, emoji="📑")
+    async def add_playlist_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        active_playlist_prompts_by_guild.pop(self.guild_id, None)
+        self.disable_all_items()
+        self.stop()
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+        await interaction.response.defer()
+        await enqueue_playlist_tracks(self.ctx, self.playlist_title, self.remaining_entries)
+
+    @discord.ui.button(label="Dismiss", style=discord.ButtonStyle.secondary, emoji="❌")
+    async def dismiss_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        active_playlist_prompts_by_guild.pop(self.guild_id, None)
+        self.disable_all_items()
+        self.stop()
+        if self.message:
+            try:
+                await self.message.edit(view=None)
+            except Exception:
+                pass
+        await interaction.response.defer()
+
+    def disable_all_items(self):
+        for item in self.children:
+            if hasattr(item, 'disabled'):
+                item.disabled = True
+
+    async def on_timeout(self):
+        active_playlist_prompts_by_guild.pop(self.guild_id, None)
+        self.disable_all_items()
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+
+    async def on_overridden(self):
+        self.disable_all_items()
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+
+
+async def enqueue_single_song_from_url(ctx, title, webpage_url, video_data=None):
+    """Enqueue a single YouTube track."""
+    if not video_data and not title:
+        video_data = await asyncio.to_thread(ytdl.extract_info, webpage_url, False)
+
+    if video_data:
+        title = title or video_data.get('title') or "YouTube Track"
+        webpage_url = video_data.get('webpage_url') or webpage_url
+
+    title = title or "YouTube Track"
+
+    if is_blacklisted_title(title):
+        await ctx.send("❌ This song is in the blacklist.")
+        return None
+
+    song_obj = make_song('youtube', title, webpage_url, ctx.author)
+    if video_data:
+        if video_data.get('url'):
+            song_obj['stream_url'] = video_data.get('url')
+            song_obj['stream_url_cached_at'] = time.time()
+        song_obj['format_id'] = video_data.get('format_id')
+        song_obj['ext'] = video_data.get('ext')
+        song_obj['duration'] = video_data.get('duration')
+
+    queue = get_music_queue(ctx.guild)
+    queue.append(song_obj)
+    save_state_to_disk()
+
+    if not ctx.voice_client:
+        await ctx.send("❌ Lost voice connection.")
+        return None
+
+    async with get_play_next_lock(getattr(ctx.guild, 'id', None)):
+        if not ctx.voice_client.is_playing():
+            await play_next(ctx)
+        else:
+            await ctx.send(f"✅ Added to queue: `{title}` (added by {ctx.author.mention})")
+
+    return song_obj
+
+
+async def enqueue_playlist_tracks(ctx, playlist_title, raw_entries):
+    """Enqueue multiple tracks from a playlist."""
+    max_items = settings.MAX_PLAYLIST_ITEMS
+    entries_to_process = raw_entries[:max_items]
+
+    skipped_blacklist = 0
+    skipped_invalid = 0
+    added_songs = []
+
+    queue = get_music_queue(ctx.guild)
+
+    for entry in entries_to_process:
+        if not entry:
+            skipped_invalid += 1
+            continue
+
+        entry_title = entry.get('title') or "YouTube Track"
+        if is_blacklisted_title(entry_title):
+            skipped_blacklist += 1
+            continue
+
+        entry_url = entry.get('webpage_url') or entry.get('url')
+        if not entry_url and entry.get('id'):
+            entry_url = f"https://www.youtube.com/watch?v={entry['id']}"
+
+        if not entry_url:
+            skipped_invalid += 1
+            continue
+
+        song_obj = make_song('youtube', entry_title, entry_url, ctx.author)
+        song_obj['duration'] = entry.get('duration')
+        queue.append(song_obj)
+        added_songs.append(song_obj)
+
+    total_added = len(added_songs)
+    if total_added == 0:
+        return await ctx.send("❌ No playable songs could be added from this playlist (all tracks were filtered or unavailable).")
+
+    save_state_to_disk()
+
+    if not ctx.voice_client:
+        return await ctx.send("❌ Lost voice connection.")
+
+    async with get_play_next_lock(getattr(ctx.guild, 'id', None)):
+        if not ctx.voice_client.is_playing():
+            await play_next(ctx)
+
+    status_msg = f"📑 Added **{total_added}** song(s) from playlist **{playlist_title}** to queue! (added by {ctx.author.mention})"
+    skipped_total = skipped_blacklist + skipped_invalid
+    if skipped_total > 0:
+        skip_details = []
+        if skipped_blacklist > 0:
+            skip_details.append(f"{skipped_blacklist} blacklisted")
+        if skipped_invalid > 0:
+            skip_details.append(f"{skipped_invalid} unavailable")
+        status_msg += f"\nℹ️ Skipped {', '.join(skip_details)} track(s)."
+    if len(raw_entries) > max_items:
+        status_msg += f"\n⚠️ Playlist capped at maximum allowed {max_items} tracks."
+
+    await ctx.send(status_msg)
+
+
+async def check_and_prompt_playlist_on_the_side(ctx, playlist_url, enqueued_id, enqueued_title, single_video_url, initial_playlist_data=None):
+    """Background task that checks for playlist tracks and presents a non-intrusive prompt on the side."""
+    try:
+        playlist_data = initial_playlist_data
+        if playlist_data is None:
+            playlist_data = await asyncio.to_thread(playlist_ytdl.extract_info, playlist_url, False)
+
+        if not playlist_data or not isinstance(playlist_data, dict):
+            return
+
+        playlist_title = playlist_data.get('title') or "YouTube Playlist"
+        raw_entries = [e for e in playlist_data.get('entries', []) if e]
+
+        # Filter out the track that was already enqueued
+        remaining_entries = []
+        for e in raw_entries:
+            if not e:
+                continue
+            e_id = e.get('id')
+            e_url = e.get('url') or e.get('webpage_url')
+            if enqueued_id and e_id == enqueued_id:
+                continue
+            if single_video_url and (e_url == single_video_url):
+                continue
+            remaining_entries.append(e)
+
+        remaining_count = len(remaining_entries)
+        if remaining_count == 0:
+            return
+
+        view = PlaylistAppendView(
+            author_id=ctx.author.id,
+            guild_id=getattr(ctx.guild, 'id', None),
+            playlist_title=playlist_title,
+            remaining_entries=remaining_entries,
+            ctx=ctx,
+            timeout=settings.PLAYLIST_CONFIRMATION_TIMEOUT,
+        )
+        view.add_playlist_button.label = f"Add Remaining ({remaining_count} tracks)"
+
+        if ctx.guild:
+            active_playlist_prompts_by_guild[ctx.guild.id] = view
+
+        if isinstance(ctx.channel, ConsoleChannel):
+            await ctx.send(
+                f"📑 **Playlist detected:** `{playlist_title}` ({remaining_count} more tracks).\n"
+                f"👉 Type **!addplaylist** (or **!addpl**) to add the rest to the queue!"
+            )
+            return
+
+        prompt_msg = await ctx.send(embed=embed, view=view)
+        view.message = prompt_msg
+
+    except Exception as e:
+        logger.debug("Silently ignored unviewable or unsupported playlist on the side: %s", e)
+
+
+async def process_youtube_playlist(ctx, parsed_yt):
+    """Plays the single song immediately, then presents a non-blocking prompt on the side to add the remaining playlist tracks."""
+    playlist_url = parsed_yt['playlist_url']
+    single_video_url = parsed_yt['single_video_url']
+
+    # Invalidate any prior playlist prompt in this guild
+    if ctx.guild:
+        cancel_pending_playlist_prompt(ctx.guild.id)
+
+    enqueued_song = None
+    enqueued_id = None
+    playlist_data = None
+
+    if single_video_url:
+        await ctx.send("🔗 Loading link...")
+        video_data = await asyncio.to_thread(ytdl.extract_info, single_video_url, False)
+        if not video_data:
+            return await ctx.send("❌ Error: Could not load song from link.")
+
+        enqueued_id = video_data.get('id') or parsed_yt.get('video_id')
+        enqueued_song = await enqueue_single_song_from_url(
+            ctx,
+            title=video_data.get('title'),
+            webpage_url=video_data.get('webpage_url') or single_video_url,
+            video_data=video_data,
+        )
+        if not enqueued_song:
+            return
+
+        # Check playlist in background on the side so song plays without any delay
+        if playlist_url:
+            asyncio.create_task(
+                check_and_prompt_playlist_on_the_side(
+                    ctx=ctx,
+                    playlist_url=playlist_url,
+                    enqueued_id=enqueued_id,
+                    enqueued_title=enqueued_song['title'],
+                    single_video_url=single_video_url,
+                    initial_playlist_data=None,
+                )
+            )
+    else:
+        # Pure playlist link without single video - fetch playlist to find first playable song
+        await ctx.send("🔗 Loading link...")
+        playlist_data = await asyncio.to_thread(playlist_ytdl.extract_info, playlist_url, False)
+        if not playlist_data:
+            return await ctx.send("❌ Could not retrieve playlist information.")
+
+        raw_entries = [e for e in playlist_data.get('entries', []) if e]
+        if not raw_entries:
+            return await ctx.send("❌ The playlist is empty or unavailable.")
+
+        first_entry = raw_entries[0]
+        first_title = first_entry.get('title') or "YouTube Track"
+        first_url = first_entry.get('webpage_url') or first_entry.get('url')
+        if not first_url and first_entry.get('id'):
+            first_url = f"https://www.youtube.com/watch?v={first_entry['id']}"
+
+        enqueued_id = first_entry.get('id')
+        enqueued_song = await enqueue_single_song_from_url(ctx, title=first_title, webpage_url=first_url)
+        if not enqueued_song:
+            return
+
+        # Check remaining tracks on the side
+        asyncio.create_task(
+            check_and_prompt_playlist_on_the_side(
+                ctx=ctx,
+                playlist_url=playlist_url,
+                enqueued_id=enqueued_id,
+                enqueued_title=enqueued_song['title'],
+                single_video_url=first_url,
+                initial_playlist_data=playlist_data,
+            )
+        )
+
 
 @bot.command()
 async def yt(ctx, *, query):
@@ -1264,21 +2097,37 @@ async def yt(ctx, *, query):
     if not ctx.voice_client or not ctx.voice_client.is_connected():
         return await ctx.send("❌ Failed to connect to voice channel.")
 
-    # 1. Determine if input is direct URL (YouTube or generic) or a search term.
+    # Invalidate any pending playlist prompt in this guild
+    if ctx.guild:
+        cancel_pending_playlist_prompt(ctx.guild.id)
+
+    # 1. Check if query is a YouTube playlist link
+    parsed_yt = parse_youtube_url(query)
+    if parsed_yt['is_playlist']:
+        return await process_youtube_playlist(ctx, parsed_yt)
+
+    # If query is a search URL (e.g. music.youtube.com/search?q=... or youtube.com/results?search_query=...)
+    if parsed_yt.get('is_search') and parsed_yt.get('search_term'):
+        query = parsed_yt['search_term']
+        parsed_yt = parse_youtube_url(query)
+
+    # 2. Determine if input is direct URL (YouTube single or generic) or a search term.
     #    Lyrics normalization is only for search terms.
-    if is_youtube_link(query):
-        search_query = query
-        await ctx.send(f"🔗 Loading link...")
+    if parsed_yt['is_youtube']:
+        search_query = parsed_yt['clean_url']
+        await ctx.send("🔗 Loading link...")
         query_type = 'url'
     elif is_probable_url(query):
-        search_query = query
-        await ctx.send(f"🔗 Loading link...")
+        search_query = sanitize_query(query)
+        await ctx.send("🔗 Loading link...")
         query_type = 'url'
     else:
         effective_search_term, _ = normalize_yt_search_term(query)
         if is_blacklisted_title(query) or is_blacklisted_title(effective_search_term):
             return await ctx.send("❌ This song is in the blacklist.")
-        await ctx.send(f"🔎 Searching YouTube for: **{query}**...")
+        search_provider = getattr(settings, 'YOUTUBE_SEARCH_PROVIDER', 'youtube_music')
+        engine_label = "YouTube Music" if search_provider == 'youtube_music' else "YouTube"
+        await ctx.send(f"🔎 Searching {engine_label} for: **{query}**...")
         query_type = 'search'
 
     try:
@@ -1306,7 +2155,7 @@ async def yt(ctx, *, query):
             return await ctx.send("❌ This song is in the blacklist.")
 
         # Use webpage_url - this will be processed by yt-dlp again during playback
-        webpage_url = video_data.get('webpage_url') or video_data.get('url')
+        webpage_url = video_data.get('music_url') or video_data.get('webpage_url') or video_data.get('url')
         
         if not webpage_url:
             logger.error(f"No URL found in video data. Keys: {list(video_data.keys())}")
@@ -1350,6 +2199,53 @@ async def yt(ctx, *, query):
         await ctx.send(f"❌ Error: {e}")
 
 
+@bot.command(aliases=['addpl', 'apl'])
+async def addplaylist(ctx):
+    """Add the remaining tracks from a recently detected playlist or mix to the queue."""
+    if not ctx.guild:
+        return await ctx.send("❌ This command can only be used in a server.")
+
+    prompt_data = active_playlist_prompts_by_guild.get(ctx.guild.id)
+    if not prompt_data:
+        return await ctx.send("❌ No active playlist prompt found (it may have expired or been overridden).")
+
+    # Invalidate the active prompt
+    cancel_pending_playlist_prompt(ctx.guild.id)
+
+    playlist_title = getattr(prompt_data, 'playlist_title', 'Playlist')
+    remaining_entries = getattr(prompt_data, 'remaining_entries', [])
+
+    if not remaining_entries:
+        return await ctx.send("❌ No remaining tracks found to add.")
+
+    await enqueue_playlist_tracks(ctx, playlist_title, remaining_entries)
+
+
+@bot.command(aliases=['pl'])
+async def playlist(ctx, *, query: str = None):
+    """Views the queue, loads a YouTube playlist, or accepts a pending playlist prompt."""
+    if query is None:
+        if ctx.guild and ctx.guild.id in active_playlist_prompts_by_guild:
+            return await addplaylist(ctx)
+        return await queue(ctx)
+
+    if query.strip().lower() in {'add', 'accept', 'yes', 'y'}:
+        return await addplaylist(ctx)
+
+    if not await ensure_voice_connected(ctx):
+        return
+
+    # Verify connection
+    if not ctx.voice_client or not ctx.voice_client.is_connected():
+        return await ctx.send("❌ Failed to connect to voice channel.")
+
+    parsed_yt = parse_youtube_url(query)
+    if parsed_yt['is_playlist']:
+        return await process_youtube_playlist(ctx, parsed_yt)
+
+    return await yt(ctx, query=query)
+
+
 @bot.command()
 async def volume(ctx, volume: int):
     """Sets volume (0-100). Usage: !volume <0-100>"""
@@ -1369,6 +2265,40 @@ async def volume(ctx, volume: int):
         ctx.voice_client.source.volume = music_volume
 
     await ctx.send(f"🔊 Volume set to **{volume}%**")
+
+
+@bot.command(aliases=['norm'])
+async def normalize(ctx, state: str = None):
+    """View or toggle EBU R128 audio loudness normalization. Usage: !normalize [on/off]"""
+    if not await enforce_command_access(ctx, 'normalize'):
+        return
+
+    current = getattr(settings, 'NORMALIZE_AUDIO', True)
+    target_lufs = getattr(settings, 'TARGET_LUFS', -16.0)
+    true_peak = getattr(settings, 'TRUE_PEAK', -1.5)
+
+    if state is None:
+        status = "enabled" if current else "disabled"
+        return await ctx.send(
+            f"🔊 Audio normalization (EBU R128 loudnorm) is **{status}**.\n"
+            f"• Target Loudness: `{target_lufs} LUFS`\n"
+            f"• True Peak Limit: `{true_peak} dBTP`\n"
+            f"Usage: `{settings.COMMAND_PREFIX}normalize on` or `{settings.COMMAND_PREFIX}normalize off`"
+        )
+
+    val = state.strip().lower()
+    if val in {'on', 'enable', 'true', '1'}:
+        settings.update_normalize_audio(True)
+        await ctx.send(
+            f"✅ Audio normalization **enabled** (EBU R128 loudnorm: `{target_lufs} LUFS`, peak `{true_peak} dBTP`).\n"
+            f"Applies to all upcoming tracks."
+        )
+    elif val in {'off', 'disable', 'false', '0'}:
+        settings.update_normalize_audio(False)
+        await ctx.send("⚠️ Audio normalization **disabled**. Songs will play at raw loudness.")
+    else:
+        await ctx.send(f"❌ Invalid option `{state}`. Use `{settings.COMMAND_PREFIX}normalize on` or `{settings.COMMAND_PREFIX}normalize off`.")
+
 
 @bot.command()
 async def skip(ctx):
@@ -1426,30 +2356,213 @@ async def skip(ctx):
 
     await ctx.send(f"🗳️ Skip vote added (**{current_votes}/{required_votes}** of {eligible_count} listeners).")
 
-@bot.command()
-async def queue(ctx):
-    """Lists the current queue."""
-    queue = get_music_queue(ctx.guild)
-    if not queue:
+class QueuePaginatorView(discord.ui.View):
+    """Interactive Discord UI View providing book-like page navigation for the music queue."""
+
+    def __init__(self, ctx, current_page: int = 1, timeout: int = None):
+        if timeout is None:
+            timeout = settings.QUEUE_PAGINATOR_TIMEOUT
+        super().__init__(timeout=timeout)
+        self.ctx = ctx
+        self.current_page = current_page
+        self.items_per_page = settings.QUEUE_ITEMS_PER_PAGE
+        self.message = None
+        self.update_buttons()
+
+    def get_queue_state(self):
+        queue = get_music_queue(self.ctx.guild)
+        music_state = get_music_state(self.ctx.guild)
+        curr_idx = music_state.get('queue_index', -1) if music_state else -1
+        loop_enabled = music_state.get('loop_enabled', False) if music_state else False
+        return queue, curr_idx, loop_enabled
+
+    def get_total_pages(self, total_songs: int) -> int:
+        if total_songs == 0:
+            return 1
+        return max(1, math.ceil(total_songs / self.items_per_page))
+
+    def build_embed(self) -> discord.Embed:
+        queue, curr_idx, loop_enabled = self.get_queue_state()
+        total_songs = len(queue)
+
+        if total_songs == 0:
+            embed = discord.Embed(
+                title="📑 Music Queue",
+                description="The queue is currently empty.",
+                color=discord.Color.blurple(),
+            )
+            return embed
+
+        total_pages = self.get_total_pages(total_songs)
+        if self.current_page > total_pages:
+            self.current_page = total_pages
+        if self.current_page < 1:
+            self.current_page = 1
+
+        start_idx = (self.current_page - 1) * self.items_per_page
+        end_idx = min(start_idx + self.items_per_page, total_songs)
+        page_songs = queue[start_idx:end_idx]
+
+        # Calculate total queue duration
+        total_duration_sec = 0.0
+        has_duration = False
+        for s in queue:
+            dur = s.get('duration')
+            if dur is not None:
+                try:
+                    total_duration_sec += float(dur)
+                    has_duration = True
+                except (ValueError, TypeError):
+                    pass
+        total_duration_str = format_duration(total_duration_sec) if has_duration and total_duration_sec > 0 else ""
+
+        # Now playing header
+        current_song = get_current_song(self.ctx.guild)
+        header = ""
+        if current_song:
+            np_dur = f" `[{format_duration(current_song.get('duration'))}]`" if current_song.get('duration') else ""
+            header = f"▶️ **Now Playing:** {current_song['title']}{np_dur}\n\n"
+
+        lines = []
+        for i, song in enumerate(page_songs, start=start_idx + 1):
+            is_playing = (i - 1 == curr_idx)
+            marker = "▶️ " if is_playing else ""
+            dur_str = f" `[{format_duration(song.get('duration'))}]`" if song.get('duration') else ""
+            requester = song.get('requester_handle') or song.get('requester_mention') or "unknown"
+
+            title = song.get('title', 'Unknown Track')
+            if len(title) > 70:
+                title = title[:67] + "..."
+
+            lines.append(f"`{i}.` {marker}**{title}**{dur_str}\n    └ Added by {requester}")
+
+        body = "\n".join(lines) if lines else "No songs on this page."
+        description = f"{header}**Up Next (Tracks {start_idx + 1} - {end_idx}):**\n{body}"
+
+        embed = discord.Embed(
+            title="📑 Music Queue",
+            description=description,
+            color=discord.Color.blurple(),
+        )
+
+        footer_parts = [
+            f"Page {self.current_page} of {total_pages}",
+            f"{total_songs} track{'s' if total_songs != 1 else ''}",
+        ]
+        if total_duration_str:
+            footer_parts.append(f"Total: {total_duration_str}")
+        if loop_enabled:
+            footer_parts.append("🔁 Loop: ON")
+
+        embed.set_footer(text=" • ".join(footer_parts))
+        return embed
+
+    def update_buttons(self):
+        queue, _, _ = self.get_queue_state()
+        total_pages = self.get_total_pages(len(queue))
+
+        if self.current_page > total_pages:
+            self.current_page = total_pages
+        if self.current_page < 1:
+            self.current_page = 1
+
+        self.first_page_button.disabled = (self.current_page <= 1)
+        self.prev_page_button.disabled = (self.current_page <= 1)
+        self.page_indicator_button.label = f"{self.current_page}/{total_pages}"
+        self.next_page_button.disabled = (self.current_page >= total_pages)
+        self.last_page_button.disabled = (self.current_page >= total_pages)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if self.ctx.guild and interaction.guild and interaction.guild.id != self.ctx.guild.id:
+            await interaction.response.send_message("❌ This queue is for another server.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(emoji="⏮️", style=discord.ButtonStyle.secondary, row=0)
+    async def first_page_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page = 1
+        self.update_buttons()
+        embed = self.build_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(emoji="◀️", style=discord.ButtonStyle.primary, row=0)
+    async def prev_page_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.current_page > 1:
+            self.current_page -= 1
+        self.update_buttons()
+        embed = self.build_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="1/1", style=discord.ButtonStyle.secondary, disabled=True, row=0)
+    async def page_indicator_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pass
+
+    @discord.ui.button(emoji="▶️", style=discord.ButtonStyle.primary, row=0)
+    async def next_page_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        queue, _, _ = self.get_queue_state()
+        total_pages = self.get_total_pages(len(queue))
+        if self.current_page < total_pages:
+            self.current_page += 1
+        self.update_buttons()
+        embed = self.build_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary, row=0)
+    async def last_page_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        queue, _, _ = self.get_queue_state()
+        total_pages = self.get_total_pages(len(queue))
+        self.current_page = total_pages
+        self.update_buttons()
+        embed = self.build_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="Close", emoji="🗑️", style=discord.ButtonStyle.danger, row=1)
+    async def dismiss_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        try:
+            await interaction.message.delete()
+        except Exception:
+            self.disable_all_items()
+            await interaction.response.edit_message(view=None)
+
+    def disable_all_items(self):
+        for item in self.children:
+            if hasattr(item, 'disabled'):
+                item.disabled = True
+
+    async def on_timeout(self):
+        self.disable_all_items()
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+
+
+@bot.command(aliases=['q'])
+async def queue(ctx, page: int = 1):
+    """Lists the current queue with interactive book-like pagination. Usage: !queue [page]"""
+    queue_list = get_music_queue(ctx.guild)
+    if not queue_list:
         await ctx.send("The queue is currently empty.")
         return
 
-    music_state = get_music_state(ctx.guild)
-    curr_idx = music_state.get('queue_index', -1) if music_state else -1
+    items_per_page = settings.QUEUE_ITEMS_PER_PAGE
+    total_pages = max(1, math.ceil(len(queue_list) / items_per_page))
 
-    # Build the string
-    queue_list = "**Playlist:**\n"
-    for i, song in enumerate(queue):
-        # i+1 makes it human readable (1, 2, 3 instead of 0, 1, 2)
-        marker = "▶️ " if i == curr_idx else ""
-        queue_list += f"`{i+1}.` {marker}{song['title']} - added by {song.get('requester_handle', 'unknown')}\n"
+    if page < 1 or page > total_pages:
+        await ctx.send(f"❌ Invalid page number. Please choose a page between 1 and {total_pages}.")
+        return
 
-    # Discord has a message limit; if queue is huge, show first N
-    max_chars = settings.DISCORD_MESSAGE_CHAR_LIMIT - settings.MESSAGE_BUFFER
-    if len(queue_list) > max_chars:
-        await ctx.send(f"{queue_list[:max_chars]}...\n*(and more)*")
-    else:
-        await ctx.send(queue_list)
+    view = QueuePaginatorView(ctx=ctx, current_page=page, timeout=settings.QUEUE_PAGINATOR_TIMEOUT)
+    embed = view.build_embed()
+
+    if isinstance(ctx.channel, ConsoleChannel):
+        await ctx.send(embed=embed)
+        return
+
+    msg = await ctx.send(embed=embed, view=view)
+    view.message = msg
 
 
 @bot.command()
@@ -1460,8 +2573,9 @@ async def current(ctx):
         await ctx.send("❌ No song is currently playing.")
         return
 
+    dur_str = f" `[{format_duration(current_song.get('duration'))}]`" if current_song.get('duration') else ""
     await ctx.send(
-        f"🎶 **Current Song:** {current_song['title']} "
+        f"🎶 **Current Song:** {current_song['title']}{dur_str} "
         f"(requested by {current_song.get('requester_mention', 'unknown')})"
     )
 
@@ -1477,6 +2591,7 @@ async def loop(ctx):
         
     current = music_state.get('loop_enabled', False)
     music_state['loop_enabled'] = not current
+    save_state_to_disk()
     
     status = "enabled" if music_state['loop_enabled'] else "disabled"
     await ctx.send(f"🔁 Playlist looping is now **{status}**.")
@@ -1505,6 +2620,7 @@ async def skipto(ctx, index: int):
     music_state = get_music_state(ctx.guild)
     if music_state:
         music_state['next_index'] = index - 1
+        save_state_to_disk()
 
     # Stop the current song. This triggers 'play_next', which pulls the song at next_index.
     ctx.voice_client.stop()
@@ -1516,14 +2632,24 @@ async def clear(ctx):
     if not await enforce_command_access(ctx, 'clear'):
         return
 
-    get_music_queue(ctx.guild).clear()
-    music_state = get_music_state(ctx.guild)
-    if music_state:
-        music_state['queue_index'] = -1
-        music_state['current_song'] = None
-        
+    guild_id = getattr(ctx.guild, 'id', None)
+    if guild_id:
+        cancel_voice_recovery(guild_id)
+
+    state = get_music_state(ctx.guild)
+    if state:
+        state['manual_stop'] = True
+        state['is_playing'] = False
+        state['was_playing'] = False
+        state['voice_channel_id'] = None
+        state['text_channel_id'] = None
+        state['saved_at'] = time.time()
+
+    clear_music_state(ctx.guild)
     if ctx.voice_client:
         ctx.voice_client.stop()
+        if guild_id:
+            cancel_voice_recovery(guild_id)
 
     if ctx.guild:
         clear_votes(ctx.guild.id)
@@ -1535,17 +2661,32 @@ async def stop(ctx):
     if not await enforce_command_access(ctx, 'stop'):
         return
 
+    guild_id = getattr(ctx.guild, 'id', None)
+    if guild_id:
+        cancel_voice_recovery(guild_id)
+        cancel_empty_voice_leave_timer(guild_id)
+        clear_votes(guild_id)
+        cancel_playback_monitor(guild_id)
+
+    state = get_music_state(ctx.guild)
+    if state:
+        state['manual_stop'] = True
+        state['is_playing'] = False
+        state['was_playing'] = False
+        state['voice_channel_id'] = None
+        state['text_channel_id'] = None
+        state['saved_at'] = time.time()
+
     clear_music_state(ctx.guild)
-    if ctx.guild:
-        cancel_empty_voice_leave_timer(ctx.guild.id)
-        clear_votes(ctx.guild.id)
-        cancel_playback_monitor(ctx.guild.id)
+
     if ctx.voice_client:
         ctx.voice_client.stop()
         try:
             await asyncio.wait_for(ctx.voice_client.disconnect(force=True), timeout=5.0)
         except Exception as e:
             logger.warning("Stop disconnect timed out/failed: %s", e)
+        if guild_id:
+            cancel_voice_recovery(guild_id)
         await clear_bot_status_if_idle()
         await ctx.send("🛑 Stopped and disconnected.")
     else:
@@ -1581,6 +2722,7 @@ async def remove(ctx, index: int):
                 music_state['next_index'] = index - 1
                 if ctx.voice_client and ctx.voice_client.is_playing():
                     ctx.voice_client.stop()
+            save_state_to_disk()
         if ctx.guild:
             clear_votes(ctx.guild.id, action_key=f"remove:{removed_song['queue_id']}")
         await ctx.send(f"🗑️ Removed `#{index}`: **{removed_song['title']}**")
@@ -1617,6 +2759,7 @@ async def remove(ctx, index: int):
                 music_state['next_index'] = current_index
                 if ctx.voice_client and ctx.voice_client.is_playing():
                     ctx.voice_client.stop()
+            save_state_to_disk()
         clear_votes(ctx.guild.id, action_key=action_key)
         await ctx.send(
             f"🗑️ Vote passed (**{current_votes}/{required_votes}** of {eligible_count} listeners). "
@@ -1802,7 +2945,7 @@ async def reload_blacklist(ctx):
         logger.error(f"Failed to reload blacklist: {e}", exc_info=True)
         await ctx.send(f"❌ Failed to reload blacklist: {e}")
 
-# Initialize blacklist patterns on startup
+# Initialize blacklist patterns and load persistent state on startup
 @bot.event
 async def setup_hook():
     """Called after the bot is logged in but before on_ready."""
@@ -1811,9 +2954,10 @@ async def setup_hook():
         validate_command_permissions_config()
         _blacklist_patterns = load_yt_blacklist_patterns()
         ensure_loop_lag_monitor()
-        logger.info(f"Blacklist initialized with {len(_blacklist_patterns)} patterns.")
+        load_state_from_disk()
+        logger.info(f"Initialized with {len(_blacklist_patterns)} blacklist patterns and persistent queue state.")
     except Exception as e:
-        logger.error(f"Failed to initialize blacklist: {e}", exc_info=True)
+        logger.error(f"Failed to initialize during setup_hook: {e}", exc_info=True)
 
 # Main bot startup
 async def main():
@@ -1824,13 +2968,49 @@ async def main():
         )
 
     logger.info("Starting MusicBot...")
-    try:
-        await bot.start(TOKEN)
-    except KeyboardInterrupt:
-        logger.info("Received Ctrl+C, shutting down gracefully...")
-        await bot.close()
-    finally:
-        stop_console_command_bridge()
+    retry_delay = settings.RECONNECT_DELAY_INITIAL
+
+    while True:
+        try:
+            start_console_command_bridge()
+            await bot.start(TOKEN)
+            if bot.is_closed():
+                break
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            logger.info("Received shutdown signal, shutting down gracefully...")
+            for gid, st in list(music_state_by_guild.items()):
+                cancel_voice_recovery(gid)
+                cancel_empty_voice_leave_timer(gid)
+                st['manual_stop'] = True
+                st['is_playing'] = False
+                st['was_playing'] = False
+                st['voice_channel_id'] = None
+                st['saved_at'] = time.time()
+            try:
+                if not bot.is_closed():
+                    await bot.close()
+            except Exception:
+                pass
+            break
+        except Exception as e:
+            if not settings.AUTO_RECONNECT:
+                logger.error(f"Fatal error (auto-reconnect disabled): {e}", exc_info=True)
+                raise
+            logger.warning(
+                f"Connection dropped or failed to connect ({e}). "
+                f"Internet connection may be interrupted. Retrying in {retry_delay:.1f}s..."
+            )
+            try:
+                if not bot.is_closed():
+                    await bot.close()
+            except Exception:
+                pass
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 1.5, settings.RECONNECT_DELAY_MAX)
+        finally:
+            save_state_to_disk()
+
+    stop_console_command_bridge()
 
 
 if __name__ == "__main__":

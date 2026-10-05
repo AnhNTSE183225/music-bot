@@ -92,16 +92,37 @@ PLAYBACK_DEBUG_METRICS = _get_env_bool(
     _get_bool(_config.get('playback', {}).get('debug_metrics', _playback_debug_default), _playback_debug_default),
 )
 YT_STREAM_CACHE_TTL_SECONDS = int(_config.get('playback', {}).get('yt_stream_cache_ttl_seconds', 300))
+NORMALIZE_AUDIO = _get_bool(_config.get('playback', {}).get('normalize_audio', True), True)
+TARGET_LUFS = float(_config.get('playback', {}).get('target_lufs', -16.0))
+TRUE_PEAK = float(_config.get('playback', {}).get('true_peak', -1.5))
+LOUDNESS_RANGE = float(_config.get('playback', {}).get('loudness_range', 11.0))
+
+# --- Resilience Settings ---
+AUTO_RECONNECT = _get_bool(_config.get('resilience', {}).get('auto_reconnect', True), True)
+RECONNECT_DELAY_INITIAL = float(_config.get('resilience', {}).get('reconnect_delay_initial', 3.0))
+RECONNECT_DELAY_MAX = float(_config.get('resilience', {}).get('reconnect_delay_max', 60.0))
+VOICE_RECONNECT_ATTEMPTS = int(_config.get('resilience', {}).get('voice_reconnect_attempts', 10))
+VOICE_RECONNECT_INTERVAL = float(_config.get('resilience', {}).get('voice_reconnect_interval', 5.0))
+AUTO_RESUME_PLAYBACK = _get_bool(_config.get('resilience', {}).get('auto_resume_playback', True), True)
+AUTO_RESUME_MAX_AGE_SECONDS = int(_config.get('resilience', {}).get('auto_resume_max_age_seconds', 300))
 
 # --- Media and Storage ---
 MEDIA_FOLDER = _config.get('storage', {}).get('media_folder', 'media')
 LOG_FILE = os.getenv('MUSICBOT_LOG_FILE', _config.get('storage', {}).get('log_file', 'musicbot.log'))
 _default_log_level = 'DEBUG' if RUNTIME_MODE == 'debug' else 'INFO'
 LOG_LEVEL = os.getenv('MUSICBOT_LOG_LEVEL', _config.get('storage', {}).get('log_level', _default_log_level))
+STATE_FILE = os.getenv('MUSICBOT_STATE_FILE', _config.get('storage', {}).get('state_file', 'queue_state.json'))
 
 # --- Message Settings ---
 DISCORD_MESSAGE_CHAR_LIMIT = _config.get('message', {}).get('embed_char_limit', 2000)
 MESSAGE_BUFFER = _config.get('message', {}).get('embed_buffer', 100)
+QUEUE_ITEMS_PER_PAGE = int(_config.get('message', {}).get('queue_items_per_page', 10))
+QUEUE_PAGINATOR_TIMEOUT = int(_config.get('message', {}).get('queue_paginator_timeout', 120))
+
+# --- YouTube Playlist & Search Settings ---
+PLAYLIST_CONFIRMATION_TIMEOUT = int(_config.get('youtube', {}).get('playlist_confirmation_timeout', 60))
+MAX_PLAYLIST_ITEMS = int(_config.get('youtube', {}).get('max_playlist_items', 200))
+YOUTUBE_SEARCH_PROVIDER = str(_config.get('youtube', {}).get('search_provider', 'youtube_music')).strip().lower()
 
 # --- YouTube Blacklist Patterns ---
 def get_blacklist_patterns():
@@ -148,19 +169,62 @@ def get_ytdl_options():
     
     return options
 
+def get_playlist_ytdl_options():
+    """Build yt-dlp format options for extracting playlist metadata."""
+    options = get_ytdl_options()
+    options['extract_flat'] = 'in_playlist'
+    options['noplaylist'] = False
+    options['playlistend'] = MAX_PLAYLIST_ITEMS
+    options['ignoreerrors'] = True
+    return options
+
+def get_search_ytdl_options():
+    """Build yt-dlp format options for extracting search result metadata efficiently."""
+    options = get_ytdl_options()
+    options['extract_flat'] = 'in_playlist'
+    options['noplaylist'] = False
+    options['playlistend'] = 10
+    options['ignoreerrors'] = True
+    return options
+
 # --- FFmpeg Options ---
+def get_audio_filter_arg():
+    """Build FFmpeg audio filter (-af) arguments for loudness normalization if enabled."""
+    playback_cfg = _config.get('playback', {}) or {}
+    if _get_bool(playback_cfg.get('normalize_audio', True), True):
+        lufs = playback_cfg.get('target_lufs', -16.0)
+        tp = playback_cfg.get('true_peak', -1.5)
+        lra = playback_cfg.get('loudness_range', 11.0)
+        return f"-af loudnorm=I={lufs}:TP={tp}:LRA={lra} "
+    return ""
+
 def get_ffmpeg_options():
-    """Build FFmpeg options from config."""
+    """Build FFmpeg options for remote network streams."""
     ffmpeg_cfg = _config.get('ffmpeg', {})
+    filter_arg = get_audio_filter_arg()
+    base_audio = ffmpeg_cfg.get('audio_only', '-vn -ar 48000 -ac 2')
 
     return {
-        'before_options': ffmpeg_cfg.get('before_options', '-v warning -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'),
-        'options': ffmpeg_cfg.get('audio_only', '-vn'),
+        'before_options': ffmpeg_cfg.get('before_options', '-v warning -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -thread_queue_size 1024 -fflags +genpts'),
+        'options': f"{filter_arg}{base_audio}".strip(),
+    }
+
+def get_local_ffmpeg_options():
+    """Build FFmpeg options for local media files (with audio filters, without network reconnect flags)."""
+    ffmpeg_cfg = _config.get('ffmpeg', {})
+    filter_arg = get_audio_filter_arg()
+    base_audio = ffmpeg_cfg.get('audio_only', '-vn -ar 48000 -ac 2')
+
+    return {
+        'options': f"{filter_arg}{base_audio}".strip(),
     }
 
 # Legacy compatibility - pre-compute these
 YTDL_OPTIONS = get_ytdl_options()
+PLAYLIST_YTDL_OPTIONS = get_playlist_ytdl_options()
+SEARCH_YTDL_OPTIONS = get_search_ytdl_options()
 FFMPEG_OPTIONS = get_ffmpeg_options()
+LOCAL_FFMPEG_OPTIONS = get_local_ffmpeg_options()
 YT_BLACKLIST_PATTERNS = get_blacklist_patterns()
 
 def save_config():
@@ -208,6 +272,18 @@ def update_blacklist_patterns(patterns_list):
     if 'youtube' not in _config:
         _config['youtube'] = {}
     _config['youtube']['blacklist_patterns'] = list(patterns_list)
+    return save_config()
+
+
+def update_normalize_audio(enabled: bool):
+    """Update normalize_audio in the config, recompute options, and save."""
+    if 'playback' not in _config:
+        _config['playback'] = {}
+    _config['playback']['normalize_audio'] = bool(enabled)
+    global NORMALIZE_AUDIO, FFMPEG_OPTIONS, LOCAL_FFMPEG_OPTIONS
+    NORMALIZE_AUDIO = bool(enabled)
+    FFMPEG_OPTIONS = get_ffmpeg_options()
+    LOCAL_FFMPEG_OPTIONS = get_local_ffmpeg_options()
     return save_config()
 
 
