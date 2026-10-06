@@ -3,6 +3,9 @@
 
 echo -e "\e[36mMusicBot Linux Background Runner\e[0m\n"
 
+# Configure which config file to use (e.g., config.prod.yaml)
+export MUSICBOT_CONFIG_FILE="config.prod.yaml"
+
 # 1. Install missing system dependencies
 echo -e "\e[33mChecking system dependencies (may ask for sudo password)...\e[0m"
 DEPS_TO_INSTALL=""
@@ -91,7 +94,7 @@ $VENV_PYTHON -m pip install -U pip yt-dlp >/dev/null 2>&1
 
 echo -e "\e[36mConfiguring Environment...\e[0m"
 RUNTIME_MODE="prod"
-MODE_CANDIDATE=$($VENV_PYTHON -c "import yaml; c=yaml.safe_load(open('config.yaml','r',encoding='utf-8')) or {}; print(str((c.get('runtime',{}) or {}).get('mode','prod')).strip().lower())" 2>/dev/null)
+MODE_CANDIDATE=$($VENV_PYTHON -c "import yaml, os; c=yaml.safe_load(open(os.getenv('MUSICBOT_CONFIG_FILE', 'config.yaml'),'r',encoding='utf-8')) or {}; print(str((c.get('runtime',{}) or {}).get('mode','prod')).strip().lower())" 2>/dev/null)
 if [ $? -eq 0 ] && [ -n "$MODE_CANDIDATE" ]; then
     if [ "$MODE_CANDIDATE" = "debug" ] || [ "$MODE_CANDIDATE" = "prod" ]; then
         RUNTIME_MODE="$MODE_CANDIDATE"

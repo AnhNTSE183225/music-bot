@@ -1,0 +1,175 @@
+# MusicBot Configuration
+# This single configuration file replaces yt_blacklist.txt, special.txt, etc.
+
+# Runtime Profile
+runtime:
+  mode: "prod"  # "prod" or "debug"
+
+# Discord Bot Settings
+discord:
+  command_prefix: "!"
+  token_env_var: "DISCORD_TOKEN"
+
+# Voice & Playback Settings
+playback:
+  default_volume: 1  # 0.0 - 1.0 (50%)
+  connection_timeout: 10.0
+  connection_stabilize_delay: 1.5
+  debug_metrics: false  # usually auto-overridden by runtime.mode in run.ps1
+  yt_stream_cache_ttl_seconds: 300
+  normalize_audio: true       # EBU R128 loudness normalization (solves quiet/loud tracks)
+  target_lufs: -16.0          # Integrated loudness target in LUFS (-14 to -16 LUFS is standard for music)
+  true_peak: -1.5             # Maximum true peak in dBTP to prevent digital clipping
+  loudness_range: 11.0        # Target loudness range (LRA) in LU
+
+# YouTube / YTDL Settings
+youtube:
+  playlist_confirmation_timeout: 60
+  max_playlist_items: 200
+  search_provider: "youtube_music"  # "youtube_music" (searches music.youtube.com) or "youtube" (searches youtube.com)
+  # Regex patterns to blacklist (one per line, supports comments with #)
+  blacklist_patterns:
+    - "(?i)\\b9+\\s*[dđ](?:[oóòỏõọôồốổỗộơờớởỡợ])(?:[aáàảãạăằắẳẵặâầấẩẫậ])\\s*(?:h(?:[oóòỏõọôồốổỗộơờớởỡợ])(?:[aáàảãạăằắẳẵặâầấẩẫậ])\\s+)?h(?:[oóòỏõọôồốổỗộơờớởỡợ])ng\\b"
+    - "(?i)\\brap\\s*vi(?:e|ệ)t\\b"
+    - "(?i)\\bsi(?:e|ê)u\\s*h(?:a|à|á|ả|ã|ạ)i\\b"
+    - "(?i)\\bkawaii\\s*kutegomen\\b"
+    - "(?i)\\bkejo\\b"
+
+# Discord Message Settings
+message:
+  # Maximum characters for queue embed before truncating
+  embed_char_limit: 2000  # Discord's limit
+  embed_buffer: 100  # Safety margin to stay under Discord's limit
+  queue_items_per_page: 10  # Number of songs to display per page in the queue paginator
+  queue_paginator_timeout: 120  # Timeout in seconds for interactive queue navigation buttons
+
+# Resilience & Auto-Reconnect Settings
+resilience:
+  auto_reconnect: true             # Automatically retry and reconnect when internet drops
+  reconnect_delay_initial: 3.0     # Initial retry delay in seconds
+  reconnect_delay_max: 60.0        # Maximum exponential backoff delay in seconds
+  voice_reconnect_attempts: 10     # Maximum voice channel reconnect attempts
+  voice_reconnect_interval: 5.0    # Interval between voice reconnect attempts in seconds
+  auto_resume_playback: true       # Automatically resume playback after network or bot restarts
+  auto_resume_max_age_seconds: 300 # Maximum age in seconds to auto-resume sessions (prevents cold restarts from another day resuming)
+
+# File Storage Settings
+storage:
+  media_folder: "media"
+  log_file: "musicbot.log"
+  log_level: "INFO"  # runtime.mode may override this at launch
+  state_file: "queue_state.json"  # Persist queue state across restarts and network drops
+
+# YouTube Downloader Options
+ytdl_options:
+  format: "bestaudio/best"
+  noplaylist: true
+  quiet: true
+  no_warnings: true
+  default_search: "auto"
+  source_address: "0.0.0.0"
+  geo_bypass: true
+  extractor_args:
+    youtube:
+      - "player_client=android"
+
+# FFmpeg Stream Options
+ffmpeg:
+  before_options: "-v warning -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -thread_queue_size 1024 -fflags +genpts"
+  audio_only: "-vn -ar 48000 -ac 2"
+
+# Command Permissions (2 roles: admin and non-admin)
+permissions:
+  # Blocked users cannot run any bot command.
+  blocked_user_ids: []
+  # When null or empty, access mode is "everyone except blocked".
+  # When this list has IDs, access mode is "only whitelisted users".
+  allowed_user_ids:
+  commands:
+    # open: anyone can run
+    # admin_only: only users with Discord Administrator permission can run
+    # vote_if_non_admin: admins run directly, non-admins must pass vote
+    help:
+      mode: "open"
+
+    join:
+      mode: "open"
+
+    play:
+      mode: "admin_only"
+
+    yt:
+      mode: "open"
+
+    playlist:
+      mode: "open"
+
+    addplaylist:
+      mode: "open"
+
+    queue:
+      mode: "open"
+
+    current:
+      mode: "open"
+
+    loop:
+      mode: "admin_only"
+
+    skip:
+      mode: "vote_if_non_admin"
+      vote:
+        threshold_type: "ratio"      # ratio or absolute
+        threshold_value: 0.5          # 50% when threshold_type is ratio
+        min_votes: 1                  # floor for required votes
+        same_channel_only: true
+        force_vote_for_admin: false   # debug: when true, admins must vote like non-admins
+
+    remove:
+      mode: "vote_if_non_admin"
+
+    skipto:
+      mode: "vote_if_non_admin"
+
+    clear:
+      mode: "admin_only"
+
+    stop:
+      mode: "open"
+
+    pause:
+      mode: "admin_only"
+
+    resume:
+      mode: "admin_only"
+
+    volume:
+      mode: "admin_only"
+
+    reload_blacklist:
+      mode: "admin_only"
+
+    block:
+      mode: "admin_only"
+
+    unblock:
+      mode: "admin_only"
+
+    whitelist:
+      mode: "admin_only"
+
+    unwhitelist:
+      mode: "admin_only"
+
+    blacklist:
+      mode: "admin_only"
+
+    normalize:
+      mode: "admin_only"
+
+# API & Web UI Settings
+api:
+  host: "0.0.0.0"
+  port: 8000
+  frontend_url: "https://anhntse183225.github.io/MusicBotUI"
+  discord_redirect_uri: "https://theanh.tail38dac5.ts.net/callback"

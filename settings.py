@@ -10,7 +10,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # Load configuration from config.yaml
-CONFIG_FILE = 'config.yaml'
+CONFIG_FILE = os.getenv('MUSICBOT_CONFIG_FILE', 'config.yaml')
 
 _yaml_rt = None
 if YAML is not None:
