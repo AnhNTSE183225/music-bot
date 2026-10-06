@@ -25,6 +25,8 @@ fi
 
 # Stop Tailscale Funnel
 if [ -f tailscale_funnel.pid ]; then
+    # Cache sudo credentials in foreground for clean prompt
+    sudo -v
     TS_PID=$(cat tailscale_funnel.pid)
     if sudo kill -0 $TS_PID 2>/dev/null; then
         echo -e "\e[33mStopping Tailscale Funnel (PID $TS_PID)...\e[0m"
