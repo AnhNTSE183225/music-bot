@@ -24,20 +24,28 @@ def set_bot(bot):
     global bot_instance
     bot_instance = bot
 
+DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
+DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
+DISCORD_REDIRECT_URI = getattr(settings, "DISCORD_REDIRECT_URI", "http://localhost:8000/callback")
+FRONTEND_URL = getattr(settings, "FRONTEND_URL", "http://localhost:3000")
+
+frontend_origin = "http://localhost:3000"
+if FRONTEND_URL:
+    try:
+        parsed = urllib.parse.urlparse(FRONTEND_URL)
+        frontend_origin = f"{parsed.scheme}://{parsed.netloc}"
+    except:
+        pass
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[frontend_origin, "http://localhost:3000", "http://127.0.0.1:3000", "https://anhntse183225.github.io"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 SESSIONS = {}
-
-DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
-DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
-DISCORD_REDIRECT_URI = getattr(settings, "DISCORD_REDIRECT_URI", "http://localhost:8000/callback")
-FRONTEND_URL = getattr(settings, "FRONTEND_URL", "http://localhost:3000")
 
 class AddSongRequest(BaseModel):
     url: str
@@ -99,7 +107,7 @@ async def callback(code: str, response: Response):
         }
         
         res = RedirectResponse(url=FRONTEND_URL)
-        res.set_cookie(key="session_id", value=session_id, httponly=True, max_age=86400, samesite="Lax")
+        res.set_cookie(key="session_id", value=session_id, httponly=True, max_age=86400, samesite="none", secure=True)
         return res
 
 async def get_current_user(session_id: str = Cookie(None)):
