@@ -26,12 +26,12 @@ fi
 # Stop Tailscale Funnel
 if [ -f tailscale_funnel.pid ]; then
     TS_PID=$(cat tailscale_funnel.pid)
-    if kill -0 $TS_PID 2>/dev/null; then
+    if sudo kill -0 $TS_PID 2>/dev/null; then
         echo -e "\e[33mStopping Tailscale Funnel (PID $TS_PID)...\e[0m"
-        kill $TS_PID
+        sudo kill $TS_PID
         
         # Wait for the process to exit cleanly
-        while kill -0 $TS_PID 2>/dev/null; do
+        while sudo kill -0 $TS_PID 2>/dev/null; do
             sleep 1
         done
         echo -e "\e[32mTailscale Funnel stopped successfully.\e[0m"

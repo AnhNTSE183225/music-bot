@@ -137,7 +137,7 @@ if [ -f tailscale_funnel.pid ] && kill -0 $(cat tailscale_funnel.pid) 2>/dev/nul
     echo -e "\e[33mTailscale Funnel is already running (PID $(cat tailscale_funnel.pid)).\e[0m"
 else
     echo -e "\e[36mStarting Tailscale Funnel on port 8000...\e[0m"
-    tailscale funnel 8000 > tailscale_funnel.log 2>&1 &
+    sudo tailscale funnel 8000 > tailscale_funnel.log 2>&1 &
     echo $! > tailscale_funnel.pid
     echo -e "\e[32mTailscale funnel started! Logs are in tailscale_funnel.log\e[0m"
 fi
