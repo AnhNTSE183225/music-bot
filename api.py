@@ -4,7 +4,7 @@ import logging
 from uuid import uuid4
 import urllib.parse
 
-from fastapi import FastAPI, Request, Response, HTTPException, Depends, Cookie
+from fastapi import FastAPI, Request, Response, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel
@@ -106,14 +106,17 @@ async def callback(code: str, response: Response):
             "access_token": access_token
         }
         
-        res = RedirectResponse(url=FRONTEND_URL)
-        res.set_cookie(key="session_id", value=session_id, httponly=True, max_age=86400, samesite="none", secure=True)
+        separator = "&" if "?" in FRONTEND_URL else "?"
+        res = RedirectResponse(url=f"{FRONTEND_URL}{separator}token={session_id}")
         return res
 
-async def get_current_user(session_id: str = Cookie(None)):
-    if not session_id or session_id not in SESSIONS:
+from fastapi.security import OAuth2PasswordBearer
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token", auto_error=False)
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    if not token or token not in SESSIONS:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    return SESSIONS[session_id]
+    return SESSIONS[token]
 
 @app.get("/api/me")
 async def get_me(user: dict = Depends(get_current_user)):
