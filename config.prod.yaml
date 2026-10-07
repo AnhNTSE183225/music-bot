@@ -138,10 +138,10 @@ permissions:
       mode: "open"
 
     pause:
-      mode: "admin_only"
+      mode: "vote_if_non_admin"
 
     resume:
-      mode: "admin_only"
+      mode: "vote_if_non_admin"
 
     volume:
       mode: "admin_only"

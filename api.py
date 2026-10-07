@@ -6,7 +6,8 @@ import urllib.parse
 
 from fastapi import FastAPI, Request, Response, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+import json
 from pydantic import BaseModel
 import httpx
 import sys
@@ -16,6 +17,13 @@ import settings
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="MusicBot API")
+
+is_shutting_down = False
+
+@app.on_event("shutdown")
+def shutdown_event():
+    global is_shutting_down
+    is_shutting_down = True
 
 # We can directly access bot_module.bot instead of bot_instance now
 bot_instance = None
@@ -199,6 +207,12 @@ def get_simulated_context(guild, user_data):
     ctx = bot_module.MusicContext(bot=bot_instance, guild=guild, channel=text_channel, author=member)
     return ctx
 
+async def enforce_api_access(ctx, command_name: str):
+    mode = bot_module.get_command_mode(command_name)
+    if mode == 'admin_only' and not bot_module.is_admin_member(ctx.author):
+        raise HTTPException(status_code=403, detail="Only administrators can use this command.")
+
+
 @app.get("/api/queue/{guild_id}")
 async def get_queue(guild_id: str, user: dict = Depends(get_current_user)):
     guild = await verify_guild_access(guild_id, user)
@@ -214,6 +228,7 @@ async def get_queue(guild_id: str, user: dict = Depends(get_current_user)):
     # but based on save_state_to_disk it's mostly a dict of strings/ints.
     
     vc = guild.voice_client if hasattr(guild, 'voice_client') else None
+    bot_connected = vc is not None
     is_paused = vc.is_paused() if vc else False
     
     position = 0
@@ -226,8 +241,9 @@ async def get_queue(guild_id: str, user: dict = Depends(get_current_user)):
         except Exception:
             pass
 
-    votes_info = bot_module.get_skip_votes_info(guild) if hasattr(bot_module, 'get_skip_votes_info') else (0, 0, 0)
-    current_votes, required_votes, eligible_count = votes_info
+    skip_v = bot_module.get_skip_votes_info(guild, 'skip') if hasattr(bot_module, 'get_skip_votes_info') else (0, 0, 0)
+    pause_v = bot_module.get_skip_votes_info(guild, 'pause') if hasattr(bot_module, 'get_skip_votes_info') else (0, 0, 0)
+    resume_v = bot_module.get_skip_votes_info(guild, 'resume') if hasattr(bot_module, 'get_skip_votes_info') else (0, 0, 0)
 
     return {
         "queue": queue,
@@ -237,15 +253,86 @@ async def get_queue(guild_id: str, user: dict = Depends(get_current_user)):
         "loop": state.get("loop_enabled", False),
         "is_playing": state.get("is_playing", False),
         "is_paused": is_paused,
+        "bot_connected": bot_connected,
         "position": position,
-        "skip_votes": current_votes,
-        "skip_votes_required": required_votes
+        "skip_votes": skip_v[0],
+        "skip_votes_required": skip_v[1],
+        "pause_votes": pause_v[0],
+        "pause_votes_required": pause_v[1],
+        "resume_votes": resume_v[0],
+        "resume_votes_required": resume_v[1]
     }
+
+@app.get("/api/stream/{guild_id}")
+async def stream_queue(guild_id: str, request: Request):
+    token = request.query_params.get("token")
+    if not token or token not in SESSIONS:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    user = SESSIONS[token]
+    guild = await verify_guild_access(guild_id, user)
+    
+    async def event_generator():
+        while True:
+            if is_shutting_down or await request.is_disconnected():
+                break
+            try:
+                state = bot_module.get_music_state(guild)
+                if not state:
+                    data = {"queue": [], "current": None, "volume": 100, "loop": False, "is_playing": False, "bot_connected": False}
+                else:
+                    queue = state.get("queue", [])
+                    current = state.get("current_song")
+                    
+                    vc = guild.voice_client if hasattr(guild, 'voice_client') else None
+                    bot_connected = vc is not None
+                    is_paused = vc.is_paused() if vc else False
+                    
+                    position = 0
+                    if vc and vc.source:
+                        try:
+                            original = vc.source.original if hasattr(vc.source, 'original') else vc.source
+                            if hasattr(original, 'frames_read'):
+                                position = original.frames_read * 0.02
+                        except Exception:
+                            pass
+
+                    skip_v = bot_module.get_skip_votes_info(guild, 'skip') if hasattr(bot_module, 'get_skip_votes_info') else (0, 0, 0)
+                    pause_v = bot_module.get_skip_votes_info(guild, 'pause') if hasattr(bot_module, 'get_skip_votes_info') else (0, 0, 0)
+                    resume_v = bot_module.get_skip_votes_info(guild, 'resume') if hasattr(bot_module, 'get_skip_votes_info') else (0, 0, 0)
+
+                    data = {
+                        "queue": queue,
+                        "current": current,
+                        "queue_index": state.get("queue_index", -1),
+                        "volume": state.get("volume", 100),
+                        "loop": state.get("loop_enabled", False),
+                        "is_playing": state.get("is_playing", False),
+                        "is_paused": is_paused,
+                        "bot_connected": bot_connected,
+                        "position": position,
+                        "skip_votes": skip_v[0],
+                        "skip_votes_required": skip_v[1],
+                        "pause_votes": pause_v[0],
+                        "pause_votes_required": pause_v[1],
+                        "resume_votes": resume_v[0],
+                        "resume_votes_required": resume_v[1]
+                    }
+                yield f"data: {json.dumps(data)}\n\n"
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"SSE error: {e}")
+                await asyncio.sleep(5)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
 
 @app.post("/api/queue/{guild_id}")
 async def add_song(guild_id: str, req: AddSongRequest, user: dict = Depends(get_current_user)):
     guild = await verify_guild_access(guild_id, user)
     ctx = get_simulated_context(guild, user)
+    await enforce_api_access(ctx, 'yt')
     
     yt_command = bot_instance.get_command('yt')
     if not yt_command:
@@ -264,6 +351,7 @@ async def add_song(guild_id: str, req: AddSongRequest, user: dict = Depends(get_
 async def skip_song(guild_id: str, user: dict = Depends(get_current_user)):
     guild = await verify_guild_access(guild_id, user)
     ctx = get_simulated_context(guild, user)
+    await enforce_api_access(ctx, 'skip')
     
     cmd = bot_instance.get_command('skip')
     try:
@@ -279,6 +367,7 @@ class IndexRequest(BaseModel):
 async def skipto_song(guild_id: str, req: IndexRequest, user: dict = Depends(get_current_user)):
     guild = await verify_guild_access(guild_id, user)
     ctx = get_simulated_context(guild, user)
+    await enforce_api_access(ctx, 'skipto')
     
     cmd = bot_instance.get_command('skipto')
     try:
@@ -291,6 +380,7 @@ async def skipto_song(guild_id: str, req: IndexRequest, user: dict = Depends(get
 async def remove_song(guild_id: str, req: IndexRequest, user: dict = Depends(get_current_user)):
     guild = await verify_guild_access(guild_id, user)
     ctx = get_simulated_context(guild, user)
+    await enforce_api_access(ctx, 'remove')
     
     cmd = bot_instance.get_command('remove')
     try:
@@ -303,6 +393,7 @@ async def remove_song(guild_id: str, req: IndexRequest, user: dict = Depends(get
 async def clear_queue(guild_id: str, user: dict = Depends(get_current_user)):
     guild = await verify_guild_access(guild_id, user)
     ctx = get_simulated_context(guild, user)
+    await enforce_api_access(ctx, 'clear')
     
     cmd = bot_instance.get_command('clear')
     try:
@@ -315,6 +406,7 @@ async def clear_queue(guild_id: str, user: dict = Depends(get_current_user)):
 async def join_channel(guild_id: str, user: dict = Depends(get_current_user)):
     guild = await verify_guild_access(guild_id, user)
     ctx = get_simulated_context(guild, user)
+    await enforce_api_access(ctx, 'join')
     
     cmd = bot_instance.get_command('join')
     try:
@@ -327,6 +419,7 @@ async def join_channel(guild_id: str, user: dict = Depends(get_current_user)):
 async def stop_song(guild_id: str, user: dict = Depends(get_current_user)):
     guild = await verify_guild_access(guild_id, user)
     ctx = get_simulated_context(guild, user)
+    await enforce_api_access(ctx, 'stop')
     
     cmd = bot_instance.get_command('stop')
     try:
@@ -339,6 +432,7 @@ async def stop_song(guild_id: str, user: dict = Depends(get_current_user)):
 async def pause_song(guild_id: str, user: dict = Depends(get_current_user)):
     guild = await verify_guild_access(guild_id, user)
     ctx = get_simulated_context(guild, user)
+    await enforce_api_access(ctx, 'pause')
     
     cmd = bot_instance.get_command('pause')
     try:
@@ -351,6 +445,7 @@ async def pause_song(guild_id: str, user: dict = Depends(get_current_user)):
 async def resume_song(guild_id: str, user: dict = Depends(get_current_user)):
     guild = await verify_guild_access(guild_id, user)
     ctx = get_simulated_context(guild, user)
+    await enforce_api_access(ctx, 'resume')
     
     cmd = bot_instance.get_command('resume')
     try:
@@ -363,6 +458,7 @@ async def resume_song(guild_id: str, user: dict = Depends(get_current_user)):
 async def loop_song(guild_id: str, user: dict = Depends(get_current_user)):
     guild = await verify_guild_access(guild_id, user)
     ctx = get_simulated_context(guild, user)
+    await enforce_api_access(ctx, 'loop')
     
     cmd = bot_instance.get_command('loop')
     try:
@@ -375,6 +471,7 @@ async def loop_song(guild_id: str, user: dict = Depends(get_current_user)):
 async def change_volume(guild_id: str, req: VolumeRequest, user: dict = Depends(get_current_user)):
     guild = await verify_guild_access(guild_id, user)
     ctx = get_simulated_context(guild, user)
+    await enforce_api_access(ctx, 'volume')
     
     cmd = bot_instance.get_command('volume')
     try:
@@ -383,10 +480,13 @@ async def change_volume(guild_id: str, req: VolumeRequest, user: dict = Depends(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+_api_server = None
+
 def start_api_server(host="0.0.0.0", port=8000):
+    global _api_server
     import uvicorn
     # Pass log_config=None so Uvicorn uses the bot's existing UTF-8 logging setup
     # instead of closing sys.stdout and overwriting existing loggers.
     config = uvicorn.Config(app, host=host, port=port, log_config=None)
-    server = uvicorn.Server(config)
-    asyncio.create_task(server.serve())
+    _api_server = uvicorn.Server(config)
+    asyncio.create_task(_api_server.serve())

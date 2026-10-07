@@ -106,6 +106,18 @@ intents = discord.Intents.all()
 
 bot = commands.Bot(command_prefix=settings.COMMAND_PREFIX, intents=intents)
 
+_original_close = bot.close
+async def _custom_close():
+    try:
+        import api
+        api.is_shutting_down = True
+        if hasattr(api, '_api_server') and api._api_server:
+            api._api_server.should_exit = True
+    except Exception:
+        pass
+    await _original_close()
+bot.close = _custom_close
+
 if settings.CONSOLE_USER_ID is not None:
     bot.owner_id = settings.CONSOLE_USER_ID
 
@@ -1230,12 +1242,14 @@ def make_song(song_type, title, data, requester):
 
 
 def is_admin_member(member):
-    """Return True if the Discord member has Administrator permission or is the bot owner."""
+    """Return True ONLY if the Discord member is the bot owner defined by USER_ID in .env."""
     if member is None:
         return False
     if settings.CONSOLE_USER_ID and member.id == settings.CONSOLE_USER_ID:
         return True
-    return bool(getattr(member.guild_permissions, 'administrator', False))
+    # Commented out: Server admins are no longer automatically MusicBot admins
+    # return bool(getattr(member.guild_permissions, 'administrator', False))
+    return False
 
 
 def get_command_mode(command_name):
@@ -1424,7 +1438,7 @@ def register_vote(guild_id, action_key, user_id):
     votes.add(user_id)
     return votes, already_voted
 
-def get_skip_votes_info(guild):
+def get_skip_votes_info(guild, action_key='skip'):
     class FakeCtx:
         def __init__(self, guild):
             self.guild = guild
@@ -1437,8 +1451,8 @@ def get_skip_votes_info(guild):
         return 0, 0, 0
         
     guild_votes = votes_by_guild.get(guild.id, {})
-    skip_votes = guild_votes.get('skip', set())
-    return len(skip_votes), required_votes, eligible_count
+    action_votes = guild_votes.get(action_key, set())
+    return len(action_votes), required_votes, eligible_count
 
 
 def validate_command_permissions_config():
@@ -2726,38 +2740,116 @@ async def clear(ctx):
 @bot.command()
 async def pause(ctx):
     """Pauses the current playing song."""
-    if not await enforce_command_access(ctx, 'pause'):
+    if not await ensure_voice_connected(ctx):
         return
 
-    if ctx.voice_client and ctx.voice_client.is_playing():
-        ctx.voice_client.pause()
-        await ctx.send("⏸️ **Paused**")
-    else:
+    if not ctx.voice_client or not ctx.voice_client.is_playing():
         await ctx.send("❌ Nothing is playing to pause.")
+        return
+
+    mode = get_command_mode('pause')
+    vote_cfg = settings.get_skip_vote_config()
+    force_vote_for_admin = vote_cfg.get('force_vote_for_admin', False)
+
+    async def execute_pause(msg):
+        clear_votes(ctx.guild.id, action_key='pause')
+        ctx.voice_client.pause()
+        await ctx.send(msg)
+
+    if is_admin_member(ctx.author) and not force_vote_for_admin:
+        await execute_pause("⏸️ **Paused** by admin.")
+        return
+
+    if mode == 'admin_only':
+        await ctx.send("❌ Only administrators can use this command.")
+        return
+
+    if mode == 'open':
+        await execute_pause("⏸️ **Paused**.")
+        return
+        
+    if vote_cfg['same_channel_only']:
+        if not ctx.author.voice or not ctx.voice_client.channel or ctx.author.voice.channel != ctx.voice_client.channel:
+            await ctx.send("❌ You must be in the same voice channel as the bot to vote.")
+            return
+            
+    required_votes, eligible_count = get_skip_vote_required_count(ctx)
+    votes, already_voted = register_vote(ctx.guild.id, 'pause', ctx.author.id)
+    current_votes = len(votes)
+
+    if already_voted:
+        await ctx.send(f"🗳️ You already voted to pause. Votes: **{current_votes}/{required_votes}**")
+        return
+
+    if current_votes >= required_votes:
+        await execute_pause(f"⏸️ Vote passed (**{current_votes}/{required_votes}** of {eligible_count} listeners). **Paused**.")
+        return
+
+    await ctx.send(f"🗳️ Pause vote added (**{current_votes}/{required_votes}** of {eligible_count} listeners).")
 
 @bot.command()
 async def resume(ctx):
     """Resumes the paused song."""
-    if not await enforce_command_access(ctx, 'resume'):
+    if not await ensure_voice_connected(ctx):
         return
 
-    if ctx.voice_client and ctx.voice_client.is_paused():
-        ctx.voice_client.resume()
-        await ctx.send("▶️ **Resumed**")
-    else:
-        # If stopped, but queue exists, try to play
-        queue = get_music_queue(ctx.guild)
-        if queue:
-            if not await ensure_voice_connected(ctx):
-                return
-            if not ctx.voice_client.is_playing() and not ctx.voice_client.is_paused():
-                await ctx.send("▶️ **Started playback**")
+    if not ctx.voice_client:
+        return
+
+    mode = get_command_mode('resume')
+    vote_cfg = settings.get_skip_vote_config()
+    force_vote_for_admin = vote_cfg.get('force_vote_for_admin', False)
+    
+    is_paused = ctx.voice_client.is_paused()
+    
+    async def execute_resume(msg):
+        clear_votes(ctx.guild.id, action_key='resume')
+        if is_paused:
+            ctx.voice_client.resume()
+            await ctx.send(msg)
+        else:
+            queue = get_music_queue(ctx.guild)
+            if queue and not ctx.voice_client.is_playing():
+                await ctx.send(msg)
                 async with get_play_next_lock(getattr(ctx.guild, 'id', None)):
                     await play_next(ctx)
             else:
-                await ctx.send("❌ Already playing or cannot resume.")
-        else:
-            await ctx.send("❌ Nothing is paused and queue is empty.")
+                await ctx.send("❌ Nothing to resume.")
+
+    if not is_paused and (not get_music_queue(ctx.guild) or ctx.voice_client.is_playing()):
+        await ctx.send("❌ Nothing is paused or stopped to resume.")
+        return
+
+    if is_admin_member(ctx.author) and not force_vote_for_admin:
+        await execute_resume("▶️ **Resumed** by admin.")
+        return
+
+    if mode == 'admin_only':
+        await ctx.send("❌ Only administrators can use this command.")
+        return
+
+    if mode == 'open':
+        await execute_resume("▶️ **Resumed**.")
+        return
+        
+    if vote_cfg['same_channel_only']:
+        if not ctx.author.voice or not ctx.voice_client.channel or ctx.author.voice.channel != ctx.voice_client.channel:
+            await ctx.send("❌ You must be in the same voice channel as the bot to vote.")
+            return
+            
+    required_votes, eligible_count = get_skip_vote_required_count(ctx)
+    votes, already_voted = register_vote(ctx.guild.id, 'resume', ctx.author.id)
+    current_votes = len(votes)
+
+    if already_voted:
+        await ctx.send(f"🗳️ You already voted to resume. Votes: **{current_votes}/{required_votes}**")
+        return
+
+    if current_votes >= required_votes:
+        await execute_resume(f"▶️ Vote passed (**{current_votes}/{required_votes}** of {eligible_count} listeners). **Resumed**.")
+        return
+
+    await ctx.send(f"🗳️ Resume vote added (**{current_votes}/{required_votes}** of {eligible_count} listeners).")
 
 @bot.command()
 async def stop(ctx):
