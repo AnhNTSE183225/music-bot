@@ -490,3 +490,8 @@ def start_api_server(host="0.0.0.0", port=8000):
     config = uvicorn.Config(app, host=host, port=port, log_config=None)
     _api_server = uvicorn.Server(config)
     asyncio.create_task(_api_server.serve())
+
+def stop_api_server():
+    global _api_server
+    if _api_server:
+        _api_server.should_exit = True

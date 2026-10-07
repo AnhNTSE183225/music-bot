@@ -1077,24 +1077,7 @@ async def clear_bot_status():
     except Exception as e:
         logger.warning(f"Failed to clear bot status: {e}")
 
-def find_best_match(query):
-    """Smart search for local files."""
-    if not os.path.exists(settings.MEDIA_FOLDER):
-        os.makedirs(settings.MEDIA_FOLDER)
-        return None
 
-    files = [f for f in os.listdir(settings.MEDIA_FOLDER) if f.endswith(('.mp3', '.mp4'))]
-    query = query.lower()
-
-    # 1. Exact Match
-    for f in files:
-        if query == f.lower(): return f
-    # 2. Partial Match
-    for f in files:
-        if query in f.lower(): return f
-    # 3. Fuzzy Match
-    close_matches = difflib.get_close_matches(query, files, n=1, cutoff=0.5)
-    return close_matches[0] if close_matches else None
 
 
 async def get_playable_search_result(search_term, max_results=10):
@@ -1532,19 +1515,7 @@ async def play_next(ctx):
     try:
         logger.debug(f"Now playing - {song['type']}: {song['title']}")
         # 1. Create the base Source
-        if song['type'] == 'local':
-            source_path = os.path.join(settings.MEDIA_FOLDER, song['data'])
-            source_init_start = time.perf_counter()
-            source = LoggingFFmpegPCMAudio(source_path, **getattr(settings, 'LOCAL_FFMPEG_OPTIONS', {}))
-            source_init_ms = int((time.perf_counter() - source_init_start) * 1000)
-            log_playback_metric(
-                "source_created",
-                queue_id=song.get('queue_id'),
-                source_type='local',
-                init_ms=source_init_ms,
-                queue_wait_ms=queue_wait_ms,
-            )
-        elif song['type'] == 'youtube':
+        if song['type'] == 'youtube':
             logger.debug(f"Creating FFmpeg source for YouTube: {song['data']}")
 
             data = None
@@ -1809,30 +1780,7 @@ async def join(ctx):
     if ctx.guild:
         ensure_empty_voice_leave_timer(ctx.guild)
 
-@bot.command()
-async def play(ctx, *, query):
-    """Plays a LOCAL file from the media folder. Usage: !play <filename>"""
-    if not await ensure_voice_connected(ctx):
-        return
 
-    # Verify connection
-    if not ctx.voice_client or not ctx.voice_client.is_connected():
-        return await ctx.send("❌ Failed to connect to voice channel.")
-
-    filename = find_best_match(query)
-    if not filename:
-        return await ctx.send(f"❌ File not found matching: {query}")
-
-    song_obj = make_song('local', filename, filename, ctx.author)
-    queue = get_music_queue(ctx.guild)
-    queue.append(song_obj)
-    save_state_to_disk()
-
-    async with get_play_next_lock(getattr(ctx.guild, 'id', None)):
-        if not ctx.voice_client.is_playing():
-            await play_next(ctx)
-        else:
-            await ctx.send(f"✅ Added to queue: `{filename}` (added by {ctx.author.mention})")
 
 class PlaylistAppendView(discord.ui.View):
     """Interactive Discord UI View prompting if the user wants to add remaining playlist tracks."""
@@ -2172,7 +2120,10 @@ async def yt(ctx, *, query):
     # 1. Check if query is a YouTube playlist link
     parsed_yt = parse_youtube_url(query)
     if parsed_yt['is_playlist']:
-        return await process_youtube_playlist(ctx, parsed_yt)
+        if settings.DETECT_PLAYLISTS:
+            return await process_youtube_playlist(ctx, parsed_yt)
+        elif parsed_yt.get('single_video_url'):
+            query = parsed_yt['single_video_url']
 
     # If query is a search URL (e.g. music.youtube.com/search?q=... or youtube.com/results?search_query=...)
     if parsed_yt.get('is_search') and parsed_yt.get('search_term'):
@@ -2316,7 +2267,10 @@ async def playlist(ctx, *, query: str = None):
 
     parsed_yt = parse_youtube_url(query)
     if parsed_yt['is_playlist']:
-        return await process_youtube_playlist(ctx, parsed_yt)
+        if settings.DETECT_PLAYLISTS:
+            return await process_youtube_playlist(ctx, parsed_yt)
+        elif parsed_yt.get('single_video_url'):
+            query = parsed_yt['single_video_url']
 
     return await yt(ctx, query=query)
 
@@ -3184,6 +3138,11 @@ async def main():
                 break
         except (KeyboardInterrupt, asyncio.CancelledError):
             logger.info("Received shutdown signal, shutting down gracefully...")
+            try:
+                import api
+                api.stop_api_server()
+            except Exception:
+                pass
             for gid, st in list(music_state_by_guild.items()):
                 cancel_voice_recovery(gid)
                 cancel_empty_voice_leave_timer(gid)

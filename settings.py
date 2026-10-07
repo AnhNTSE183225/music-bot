@@ -120,6 +120,7 @@ QUEUE_ITEMS_PER_PAGE = int(_config.get('message', {}).get('queue_items_per_page'
 QUEUE_PAGINATOR_TIMEOUT = int(_config.get('message', {}).get('queue_paginator_timeout', 120))
 
 # --- YouTube Playlist & Search Settings ---
+DETECT_PLAYLISTS = _get_bool(_config.get('youtube', {}).get('detect_playlists', False), False)
 PLAYLIST_CONFIRMATION_TIMEOUT = int(_config.get('youtube', {}).get('playlist_confirmation_timeout', 60))
 MAX_PLAYLIST_ITEMS = int(_config.get('youtube', {}).get('max_playlist_items', 200))
 YOUTUBE_SEARCH_PROVIDER = str(_config.get('youtube', {}).get('search_provider', 'youtube_music')).strip().lower()
