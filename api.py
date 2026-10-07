@@ -215,6 +215,19 @@ async def get_queue(guild_id: str, user: dict = Depends(get_current_user)):
     
     vc = guild.voice_client if hasattr(guild, 'voice_client') else None
     is_paused = vc.is_paused() if vc else False
+    
+    position = 0
+    if vc and vc.source:
+        try:
+            # vc.source is typically a PCMVolumeTransformer, whose original source is LoggingFFmpegPCMAudio
+            original = vc.source.original if hasattr(vc.source, 'original') else vc.source
+            if hasattr(original, 'frames_read'):
+                position = original.frames_read * 0.02
+        except Exception:
+            pass
+
+    votes_info = bot_module.get_skip_votes_info(guild) if hasattr(bot_module, 'get_skip_votes_info') else (0, 0, 0)
+    current_votes, required_votes, eligible_count = votes_info
 
     return {
         "queue": queue,
@@ -223,7 +236,10 @@ async def get_queue(guild_id: str, user: dict = Depends(get_current_user)):
         "volume": state.get("volume", 100),
         "loop": state.get("loop_enabled", False),
         "is_playing": state.get("is_playing", False),
-        "is_paused": is_paused
+        "is_paused": is_paused,
+        "position": position,
+        "skip_votes": current_votes,
+        "skip_votes_required": required_votes
     }
 
 @app.post("/api/queue/{guild_id}")
@@ -279,6 +295,18 @@ async def remove_song(guild_id: str, req: IndexRequest, user: dict = Depends(get
     cmd = bot_instance.get_command('remove')
     try:
         await cmd.callback(ctx, req.index)
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/controls/{guild_id}/clear")
+async def clear_queue(guild_id: str, user: dict = Depends(get_current_user)):
+    guild = await verify_guild_access(guild_id, user)
+    ctx = get_simulated_context(guild, user)
+    
+    cmd = bot_instance.get_command('clear')
+    try:
+        await cmd.callback(ctx)
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

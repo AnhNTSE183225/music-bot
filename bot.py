@@ -77,6 +77,7 @@ import threading
 
 class LoggingFFmpegPCMAudio(discord.FFmpegPCMAudio):
     def __init__(self, *args, **kwargs):
+        self.frames_read = 0
         kwargs.pop('stderr', None)
         super().__init__(*args, **kwargs)
         
@@ -84,6 +85,12 @@ class LoggingFFmpegPCMAudio(discord.FFmpegPCMAudio):
         if hasattr(self, '_process') and self._process and getattr(self._process, 'stderr', None):
             self._stderr_thread = threading.Thread(target=self._log_stderr, daemon=True)
             self._stderr_thread.start()
+
+    def read(self):
+        ret = super().read()
+        if ret:
+            self.frames_read += 1
+        return ret
 
     def _log_stderr(self):
         if hasattr(self, '_process') and self._process and self._process.stderr:
@@ -1417,6 +1424,22 @@ def register_vote(guild_id, action_key, user_id):
     votes.add(user_id)
     return votes, already_voted
 
+def get_skip_votes_info(guild):
+    class FakeCtx:
+        def __init__(self, guild):
+            self.guild = guild
+            self.voice_client = guild.voice_client
+    
+    ctx = FakeCtx(guild)
+    try:
+        required_votes, eligible_count = get_skip_vote_required_count(ctx)
+    except Exception:
+        return 0, 0, 0
+        
+    guild_votes = votes_by_guild.get(guild.id, {})
+    skip_votes = guild_votes.get('skip', set())
+    return len(skip_votes), required_votes, eligible_count
+
 
 def validate_command_permissions_config():
     """Ensure every registered command has an explicit permissions config entry."""
@@ -1889,6 +1912,13 @@ async def enqueue_single_song_from_url(ctx, title, webpage_url, video_data=None)
             song_obj['stream_url'] = video_data.get('url')
             song_obj['stream_url_cached_at'] = time.time()
         song_obj['format_id'] = video_data.get('format_id')
+        if video_data.get('thumbnail'):
+            song_obj['thumbnail'] = video_data.get('thumbnail')
+            
+        artist = video_data.get('artist') or video_data.get('creator') or video_data.get('uploader') or video_data.get('channel')
+        if artist:
+            song_obj['artist'] = artist
+            
         song_obj['ext'] = video_data.get('ext')
         song_obj['duration'] = video_data.get('duration')
 
@@ -1940,6 +1970,13 @@ async def enqueue_playlist_tracks(ctx, playlist_title, raw_entries):
 
         song_obj = make_song('youtube', entry_title, entry_url, ctx.author)
         song_obj['duration'] = entry.get('duration')
+        if entry.get('thumbnail'):
+            song_obj['thumbnail'] = entry.get('thumbnail')
+            
+        artist = entry.get('artist') or entry.get('creator') or entry.get('uploader') or entry.get('channel')
+        if artist:
+            song_obj['artist'] = artist
+            
         queue.append(song_obj)
         added_songs.append(song_obj)
 
@@ -2195,6 +2232,13 @@ async def yt(ctx, *, query):
             song_obj['stream_url'] = video_data.get('url')
             song_obj['stream_url_cached_at'] = time.time()
         song_obj['format_id'] = video_data.get('format_id')
+        if video_data.get('thumbnail'):
+            song_obj['thumbnail'] = video_data.get('thumbnail')
+            
+        artist = video_data.get('artist') or video_data.get('creator') or video_data.get('uploader') or video_data.get('channel')
+        if artist:
+            song_obj['artist'] = artist
+            
         song_obj['ext'] = video_data.get('ext')
         song_obj['duration'] = video_data.get('duration')
         queue = get_music_queue(ctx.guild)
@@ -2320,26 +2364,34 @@ async def normalize(ctx, state: str = None):
 @bot.command()
 async def skip(ctx):
     """Skips current song based on configured permissions and vote rules."""
-    if not ctx.voice_client or not ctx.voice_client.is_playing():
-        await ctx.send("❌ Nothing is playing.")
+    if not await ensure_voice_connected(ctx):
+        return
+
+    if not ctx.voice_client.is_playing() and not get_music_queue(ctx.guild):
+        await ctx.send("❌ Nothing is playing and the queue is empty.")
         return
 
     mode = get_command_mode('skip')
     vote_cfg = settings.get_skip_vote_config()
     force_vote_for_admin = vote_cfg.get('force_vote_for_admin', False)
 
-    if is_admin_member(ctx.author) and not force_vote_for_admin:
+    async def execute_skip(msg):
         clear_votes(ctx.guild.id, action_key='skip')
-        ctx.voice_client.stop()
-        await ctx.send("⏭️ Skipped by admin.")
+        await ctx.send(msg)
+        if ctx.voice_client.is_playing():
+            ctx.voice_client.stop()
+        else:
+            async with get_play_next_lock(getattr(ctx.guild, 'id', None)):
+                await play_next(ctx)
+
+    if is_admin_member(ctx.author) and not force_vote_for_admin:
+        await execute_skip("⏭️ Skipped by admin.")
         return
 
     # Let the requester skip their own currently playing song directly.
     current_song = get_current_song(ctx.guild)
     if current_song and current_song.get('requester_id') == ctx.author.id:
-        clear_votes(ctx.guild.id, action_key='skip')
-        ctx.voice_client.stop()
-        await ctx.send("⏭️ Skipped your own song.")
+        await execute_skip("⏭️ Skipped your own song.")
         return
 
     if mode == 'admin_only':
@@ -2347,9 +2399,7 @@ async def skip(ctx):
         return
 
     if mode == 'open':
-        clear_votes(ctx.guild.id, action_key='skip')
-        ctx.voice_client.stop()
-        await ctx.send("⏭️ Skipped.")
+        await execute_skip("⏭️ Skipped.")
         return
 
     if vote_cfg['same_channel_only']:
@@ -2366,9 +2416,7 @@ async def skip(ctx):
         return
 
     if current_votes >= required_votes:
-        clear_votes(ctx.guild.id, action_key='skip')
-        ctx.voice_client.stop()
-        await ctx.send(f"⏭️ Vote passed (**{current_votes}/{required_votes}** of {eligible_count} listeners). Skipping.")
+        await execute_skip(f"⏭️ Vote passed (**{current_votes}/{required_votes}** of {eligible_count} listeners). Skipping.")
         return
 
     await ctx.send(f"🗳️ Skip vote added (**{current_votes}/{required_votes}** of {eligible_count} listeners).")
@@ -2619,8 +2667,7 @@ async def skipto(ctx, index: int):
     if not await enforce_command_access(ctx, 'skipto'):
         return
 
-    if not ctx.voice_client or not ctx.voice_client.is_playing():
-        await ctx.send("❌ Nothing is playing right now.")
+    if not await ensure_voice_connected(ctx):
         return
 
     queue = get_music_queue(ctx.guild)
@@ -2639,9 +2686,14 @@ async def skipto(ctx, index: int):
         music_state['next_index'] = index - 1
         save_state_to_disk()
 
-    # Stop the current song. This triggers 'play_next', which pulls the song at next_index.
-    ctx.voice_client.stop()
-    await ctx.send(f"⏭️ Skipped to position **{index}**.")
+    if not ctx.voice_client.is_playing():
+        await ctx.send(f"⏭️ Skipped to position **{index}**.")
+        async with get_play_next_lock(getattr(ctx.guild, 'id', None)):
+            await play_next(ctx)
+    else:
+        # Stop the current song. This triggers 'play_next', which pulls the song at next_index.
+        ctx.voice_client.stop()
+        await ctx.send(f"⏭️ Skipped to position **{index}**.")
 
 @bot.command()
 async def clear(ctx):
@@ -2693,7 +2745,19 @@ async def resume(ctx):
         ctx.voice_client.resume()
         await ctx.send("▶️ **Resumed**")
     else:
-        await ctx.send("❌ Nothing is paused.")
+        # If stopped, but queue exists, try to play
+        queue = get_music_queue(ctx.guild)
+        if queue:
+            if not await ensure_voice_connected(ctx):
+                return
+            if not ctx.voice_client.is_playing() and not ctx.voice_client.is_paused():
+                await ctx.send("▶️ **Started playback**")
+                async with get_play_next_lock(getattr(ctx.guild, 'id', None)):
+                    await play_next(ctx)
+            else:
+                await ctx.send("❌ Already playing or cannot resume.")
+        else:
+            await ctx.send("❌ Nothing is paused and queue is empty.")
 
 @bot.command()
 async def stop(ctx):
