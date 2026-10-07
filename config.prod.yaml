@@ -171,5 +171,5 @@ permissions:
 api:
   host: "0.0.0.0"
   port: 8000
-  frontend_url: "https://anhntse183225.github.io/MusicBotUI"
+  frontend_url: "https://musicbotui.pages.dev"
   discord_redirect_uri: "https://theanh.tail38dac5.ts.net/callback"
