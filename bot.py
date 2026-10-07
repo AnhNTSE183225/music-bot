@@ -274,13 +274,19 @@ def save_state_to_disk():
         if parent_dir and not os.path.exists(parent_dir):
             os.makedirs(parent_dir, exist_ok=True)
 
-        temp_path = f"{state_path}.tmp"
-        with open(temp_path, 'w', encoding='utf-8') as f:
-            json.dump(data_to_save, f, indent=2, ensure_ascii=False)
-        os.replace(temp_path, state_path)
-        logger.debug("Saved queue state to %s (%d guilds)", state_path, len(data_to_save))
+        def _write_to_disk(save_data, final_path):
+            try:
+                temp_path = f"{final_path}.tmp"
+                with open(temp_path, 'w', encoding='utf-8') as f:
+                    json.dump(save_data, f, indent=2, ensure_ascii=False)
+                os.replace(temp_path, final_path)
+                logger.debug("Saved queue state to %s (%d guilds)", final_path, len(save_data))
+            except Exception as e:
+                logger.warning(f"Failed to save queue state: {e}")
+
+        threading.Thread(target=_write_to_disk, args=(data_to_save, state_path), daemon=True).start()
     except Exception as e:
-        logger.warning(f"Failed to save queue state: {e}")
+        logger.warning(f"Failed to prepare queue state for saving: {e}")
 
 
 def load_state_from_disk():
