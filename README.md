@@ -4,7 +4,7 @@ A Discord music bot built with discord.py and yt-dlp.
 
 ## Prerequisites
 
-- Python 3.8 or higher
+- Python 3.8 or higher 12123123123
 - Windows PowerShell (or equivalent)
 
 ## Installation & Setup
