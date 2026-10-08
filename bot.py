@@ -30,12 +30,25 @@ load_dotenv()
 import settings
 
 # Configure logging with UTF-8 encoding to handle emoji and Unicode characters
+# Keep a global reference to the wrapper so it is never garbage collected,
+# which prevents its __del__ from automatically closing sys.stdout.buffer!
+_GLOBAL_UTF8_STREAM = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+
 # Create a UTF-8 stream wrapper for stdout to handle emoji
 class UTF8StreamHandler(logging.StreamHandler):
     def __init__(self):
-        # Use a UTF-8 text wrapper around stdout.buffer
-        utf8_stream = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-        super().__init__(utf8_stream)
+        super().__init__(_GLOBAL_UTF8_STREAM)
+        
+    def close(self):
+        # Override close to prevent closing sys.stdout when handlers are refreshed
+        self.acquire()
+        try:
+            if self.stream:
+                self.flush()
+            # Do not close the stream!
+        finally:
+            self.release()
+
 
 # Configure logging with custom UTF-8 handler
 logging.basicConfig(
@@ -64,6 +77,7 @@ import threading
 
 class LoggingFFmpegPCMAudio(discord.FFmpegPCMAudio):
     def __init__(self, *args, **kwargs):
+        self.frames_read = 0
         kwargs.pop('stderr', None)
         super().__init__(*args, **kwargs)
         
@@ -71,6 +85,12 @@ class LoggingFFmpegPCMAudio(discord.FFmpegPCMAudio):
         if hasattr(self, '_process') and self._process and getattr(self._process, 'stderr', None):
             self._stderr_thread = threading.Thread(target=self._log_stderr, daemon=True)
             self._stderr_thread.start()
+
+    def read(self):
+        ret = super().read()
+        if ret:
+            self.frames_read += 1
+        return ret
 
     def _log_stderr(self):
         if hasattr(self, '_process') and self._process and self._process.stderr:
@@ -85,6 +105,18 @@ class LoggingFFmpegPCMAudio(discord.FFmpegPCMAudio):
 intents = discord.Intents.all()
 
 bot = commands.Bot(command_prefix=settings.COMMAND_PREFIX, intents=intents)
+
+_original_close = bot.close
+async def _custom_close():
+    try:
+        import api
+        api.is_shutting_down = True
+        if hasattr(api, '_api_server') and api._api_server:
+            api._api_server.should_exit = True
+    except Exception:
+        pass
+    await _original_close()
+bot.close = _custom_close
 
 if settings.CONSOLE_USER_ID is not None:
     bot.owner_id = settings.CONSOLE_USER_ID
@@ -242,13 +274,19 @@ def save_state_to_disk():
         if parent_dir and not os.path.exists(parent_dir):
             os.makedirs(parent_dir, exist_ok=True)
 
-        temp_path = f"{state_path}.tmp"
-        with open(temp_path, 'w', encoding='utf-8') as f:
-            json.dump(data_to_save, f, indent=2, ensure_ascii=False)
-        os.replace(temp_path, state_path)
-        logger.debug("Saved queue state to %s (%d guilds)", state_path, len(data_to_save))
+        def _write_to_disk(save_data, final_path):
+            try:
+                temp_path = f"{final_path}.tmp"
+                with open(temp_path, 'w', encoding='utf-8') as f:
+                    json.dump(save_data, f, indent=2, ensure_ascii=False)
+                os.replace(temp_path, final_path)
+                logger.debug("Saved queue state to %s (%d guilds)", final_path, len(save_data))
+            except Exception as e:
+                logger.warning(f"Failed to save queue state: {e}")
+
+        threading.Thread(target=_write_to_disk, args=(data_to_save, state_path), daemon=True).start()
     except Exception as e:
-        logger.warning(f"Failed to save queue state: {e}")
+        logger.warning(f"Failed to prepare queue state for saving: {e}")
 
 
 def load_state_from_disk():
@@ -1045,24 +1083,7 @@ async def clear_bot_status():
     except Exception as e:
         logger.warning(f"Failed to clear bot status: {e}")
 
-def find_best_match(query):
-    """Smart search for local files."""
-    if not os.path.exists(settings.MEDIA_FOLDER):
-        os.makedirs(settings.MEDIA_FOLDER)
-        return None
 
-    files = [f for f in os.listdir(settings.MEDIA_FOLDER) if f.endswith(('.mp3', '.mp4'))]
-    query = query.lower()
-
-    # 1. Exact Match
-    for f in files:
-        if query == f.lower(): return f
-    # 2. Partial Match
-    for f in files:
-        if query in f.lower(): return f
-    # 3. Fuzzy Match
-    close_matches = difflib.get_close_matches(query, files, n=1, cutoff=0.5)
-    return close_matches[0] if close_matches else None
 
 
 async def get_playable_search_result(search_term, max_results=10):
@@ -1210,8 +1231,14 @@ def make_song(song_type, title, data, requester):
 
 
 def is_admin_member(member):
-    """Return True if the Discord member has Administrator permission."""
-    return bool(getattr(member.guild_permissions, 'administrator', False))
+    """Return True ONLY if the Discord member is the bot owner defined by USER_ID in .env."""
+    if member is None:
+        return False
+    if settings.CONSOLE_USER_ID and member.id == settings.CONSOLE_USER_ID:
+        return True
+    # Commented out: Server admins are no longer automatically MusicBot admins
+    # return bool(getattr(member.guild_permissions, 'administrator', False))
+    return False
 
 
 def get_command_mode(command_name):
@@ -1400,6 +1427,22 @@ def register_vote(guild_id, action_key, user_id):
     votes.add(user_id)
     return votes, already_voted
 
+def get_skip_votes_info(guild, action_key='skip'):
+    class FakeCtx:
+        def __init__(self, guild):
+            self.guild = guild
+            self.voice_client = guild.voice_client
+    
+    ctx = FakeCtx(guild)
+    try:
+        required_votes, eligible_count = get_skip_vote_required_count(ctx)
+    except Exception:
+        return 0, 0, 0
+        
+    guild_votes = votes_by_guild.get(guild.id, {})
+    action_votes = guild_votes.get(action_key, set())
+    return len(action_votes), required_votes, eligible_count
+
 
 def validate_command_permissions_config():
     """Ensure every registered command has an explicit permissions config entry."""
@@ -1478,19 +1521,7 @@ async def play_next(ctx):
     try:
         logger.debug(f"Now playing - {song['type']}: {song['title']}")
         # 1. Create the base Source
-        if song['type'] == 'local':
-            source_path = os.path.join(settings.MEDIA_FOLDER, song['data'])
-            source_init_start = time.perf_counter()
-            source = LoggingFFmpegPCMAudio(source_path, **getattr(settings, 'LOCAL_FFMPEG_OPTIONS', {}))
-            source_init_ms = int((time.perf_counter() - source_init_start) * 1000)
-            log_playback_metric(
-                "source_created",
-                queue_id=song.get('queue_id'),
-                source_type='local',
-                init_ms=source_init_ms,
-                queue_wait_ms=queue_wait_ms,
-            )
-        elif song['type'] == 'youtube':
+        if song['type'] == 'youtube':
             logger.debug(f"Creating FFmpeg source for YouTube: {song['data']}")
 
             data = None
@@ -1755,30 +1786,7 @@ async def join(ctx):
     if ctx.guild:
         ensure_empty_voice_leave_timer(ctx.guild)
 
-@bot.command()
-async def play(ctx, *, query):
-    """Plays a LOCAL file from the media folder. Usage: !play <filename>"""
-    if not await ensure_voice_connected(ctx):
-        return
 
-    # Verify connection
-    if not ctx.voice_client or not ctx.voice_client.is_connected():
-        return await ctx.send("❌ Failed to connect to voice channel.")
-
-    filename = find_best_match(query)
-    if not filename:
-        return await ctx.send(f"❌ File not found matching: {query}")
-
-    song_obj = make_song('local', filename, filename, ctx.author)
-    queue = get_music_queue(ctx.guild)
-    queue.append(song_obj)
-    save_state_to_disk()
-
-    async with get_play_next_lock(getattr(ctx.guild, 'id', None)):
-        if not ctx.voice_client.is_playing():
-            await play_next(ctx)
-        else:
-            await ctx.send(f"✅ Added to queue: `{filename}` (added by {ctx.author.mention})")
 
 class PlaylistAppendView(discord.ui.View):
     """Interactive Discord UI View prompting if the user wants to add remaining playlist tracks."""
@@ -1872,6 +1880,13 @@ async def enqueue_single_song_from_url(ctx, title, webpage_url, video_data=None)
             song_obj['stream_url'] = video_data.get('url')
             song_obj['stream_url_cached_at'] = time.time()
         song_obj['format_id'] = video_data.get('format_id')
+        if video_data.get('thumbnail'):
+            song_obj['thumbnail'] = video_data.get('thumbnail')
+            
+        artist = video_data.get('artist') or video_data.get('creator') or video_data.get('uploader') or video_data.get('channel')
+        if artist:
+            song_obj['artist'] = artist
+            
         song_obj['ext'] = video_data.get('ext')
         song_obj['duration'] = video_data.get('duration')
 
@@ -1923,6 +1938,13 @@ async def enqueue_playlist_tracks(ctx, playlist_title, raw_entries):
 
         song_obj = make_song('youtube', entry_title, entry_url, ctx.author)
         song_obj['duration'] = entry.get('duration')
+        if entry.get('thumbnail'):
+            song_obj['thumbnail'] = entry.get('thumbnail')
+            
+        artist = entry.get('artist') or entry.get('creator') or entry.get('uploader') or entry.get('channel')
+        if artist:
+            song_obj['artist'] = artist
+            
         queue.append(song_obj)
         added_songs.append(song_obj)
 
@@ -2104,7 +2126,10 @@ async def yt(ctx, *, query):
     # 1. Check if query is a YouTube playlist link
     parsed_yt = parse_youtube_url(query)
     if parsed_yt['is_playlist']:
-        return await process_youtube_playlist(ctx, parsed_yt)
+        if settings.DETECT_PLAYLISTS:
+            return await process_youtube_playlist(ctx, parsed_yt)
+        elif parsed_yt.get('single_video_url'):
+            query = parsed_yt['single_video_url']
 
     # If query is a search URL (e.g. music.youtube.com/search?q=... or youtube.com/results?search_query=...)
     if parsed_yt.get('is_search') and parsed_yt.get('search_term'):
@@ -2178,6 +2203,13 @@ async def yt(ctx, *, query):
             song_obj['stream_url'] = video_data.get('url')
             song_obj['stream_url_cached_at'] = time.time()
         song_obj['format_id'] = video_data.get('format_id')
+        if video_data.get('thumbnail'):
+            song_obj['thumbnail'] = video_data.get('thumbnail')
+            
+        artist = video_data.get('artist') or video_data.get('creator') or video_data.get('uploader') or video_data.get('channel')
+        if artist:
+            song_obj['artist'] = artist
+            
         song_obj['ext'] = video_data.get('ext')
         song_obj['duration'] = video_data.get('duration')
         queue = get_music_queue(ctx.guild)
@@ -2241,7 +2273,10 @@ async def playlist(ctx, *, query: str = None):
 
     parsed_yt = parse_youtube_url(query)
     if parsed_yt['is_playlist']:
-        return await process_youtube_playlist(ctx, parsed_yt)
+        if settings.DETECT_PLAYLISTS:
+            return await process_youtube_playlist(ctx, parsed_yt)
+        elif parsed_yt.get('single_video_url'):
+            query = parsed_yt['single_video_url']
 
     return await yt(ctx, query=query)
 
@@ -2303,26 +2338,34 @@ async def normalize(ctx, state: str = None):
 @bot.command()
 async def skip(ctx):
     """Skips current song based on configured permissions and vote rules."""
-    if not ctx.voice_client or not ctx.voice_client.is_playing():
-        await ctx.send("❌ Nothing is playing.")
+    if not await ensure_voice_connected(ctx):
+        return
+
+    if not ctx.voice_client.is_playing() and not get_music_queue(ctx.guild):
+        await ctx.send("❌ Nothing is playing and the queue is empty.")
         return
 
     mode = get_command_mode('skip')
     vote_cfg = settings.get_skip_vote_config()
     force_vote_for_admin = vote_cfg.get('force_vote_for_admin', False)
 
-    if is_admin_member(ctx.author) and not force_vote_for_admin:
+    async def execute_skip(msg):
         clear_votes(ctx.guild.id, action_key='skip')
-        ctx.voice_client.stop()
-        await ctx.send("⏭️ Skipped by admin.")
+        await ctx.send(msg)
+        if ctx.voice_client.is_playing():
+            ctx.voice_client.stop()
+        else:
+            async with get_play_next_lock(getattr(ctx.guild, 'id', None)):
+                await play_next(ctx)
+
+    if is_admin_member(ctx.author) and not force_vote_for_admin:
+        await execute_skip("⏭️ Skipped by admin.")
         return
 
     # Let the requester skip their own currently playing song directly.
     current_song = get_current_song(ctx.guild)
     if current_song and current_song.get('requester_id') == ctx.author.id:
-        clear_votes(ctx.guild.id, action_key='skip')
-        ctx.voice_client.stop()
-        await ctx.send("⏭️ Skipped your own song.")
+        await execute_skip("⏭️ Skipped your own song.")
         return
 
     if mode == 'admin_only':
@@ -2330,9 +2373,7 @@ async def skip(ctx):
         return
 
     if mode == 'open':
-        clear_votes(ctx.guild.id, action_key='skip')
-        ctx.voice_client.stop()
-        await ctx.send("⏭️ Skipped.")
+        await execute_skip("⏭️ Skipped.")
         return
 
     if vote_cfg['same_channel_only']:
@@ -2349,9 +2390,7 @@ async def skip(ctx):
         return
 
     if current_votes >= required_votes:
-        clear_votes(ctx.guild.id, action_key='skip')
-        ctx.voice_client.stop()
-        await ctx.send(f"⏭️ Vote passed (**{current_votes}/{required_votes}** of {eligible_count} listeners). Skipping.")
+        await execute_skip(f"⏭️ Vote passed (**{current_votes}/{required_votes}** of {eligible_count} listeners). Skipping.")
         return
 
     await ctx.send(f"🗳️ Skip vote added (**{current_votes}/{required_votes}** of {eligible_count} listeners).")
@@ -2602,8 +2641,7 @@ async def skipto(ctx, index: int):
     if not await enforce_command_access(ctx, 'skipto'):
         return
 
-    if not ctx.voice_client or not ctx.voice_client.is_playing():
-        await ctx.send("❌ Nothing is playing right now.")
+    if not await ensure_voice_connected(ctx):
         return
 
     queue = get_music_queue(ctx.guild)
@@ -2622,9 +2660,14 @@ async def skipto(ctx, index: int):
         music_state['next_index'] = index - 1
         save_state_to_disk()
 
-    # Stop the current song. This triggers 'play_next', which pulls the song at next_index.
-    ctx.voice_client.stop()
-    await ctx.send(f"⏭️ Skipped to position **{index}**.")
+    if not ctx.voice_client.is_playing():
+        await ctx.send(f"⏭️ Skipped to position **{index}**.")
+        async with get_play_next_lock(getattr(ctx.guild, 'id', None)):
+            await play_next(ctx)
+    else:
+        # Stop the current song. This triggers 'play_next', which pulls the song at next_index.
+        ctx.voice_client.stop()
+        await ctx.send(f"⏭️ Skipped to position **{index}**.")
 
 @bot.command()
 async def clear(ctx):
@@ -2654,6 +2697,119 @@ async def clear(ctx):
     if ctx.guild:
         clear_votes(ctx.guild.id)
     await ctx.send("🗑️ **Playlist cleared.**")
+@bot.command()
+async def pause(ctx):
+    """Pauses the current playing song."""
+    if not await ensure_voice_connected(ctx):
+        return
+
+    if not ctx.voice_client or not ctx.voice_client.is_playing():
+        await ctx.send("❌ Nothing is playing to pause.")
+        return
+
+    mode = get_command_mode('pause')
+    vote_cfg = settings.get_skip_vote_config()
+    force_vote_for_admin = vote_cfg.get('force_vote_for_admin', False)
+
+    async def execute_pause(msg):
+        clear_votes(ctx.guild.id, action_key='pause')
+        ctx.voice_client.pause()
+        await ctx.send(msg)
+
+    if is_admin_member(ctx.author) and not force_vote_for_admin:
+        await execute_pause("⏸️ **Paused** by admin.")
+        return
+
+    if mode == 'admin_only':
+        await ctx.send("❌ Only administrators can use this command.")
+        return
+
+    if mode == 'open':
+        await execute_pause("⏸️ **Paused**.")
+        return
+        
+    if vote_cfg['same_channel_only']:
+        if not ctx.author.voice or not ctx.voice_client.channel or ctx.author.voice.channel != ctx.voice_client.channel:
+            await ctx.send("❌ You must be in the same voice channel as the bot to vote.")
+            return
+            
+    required_votes, eligible_count = get_skip_vote_required_count(ctx)
+    votes, already_voted = register_vote(ctx.guild.id, 'pause', ctx.author.id)
+    current_votes = len(votes)
+
+    if already_voted:
+        await ctx.send(f"🗳️ You already voted to pause. Votes: **{current_votes}/{required_votes}**")
+        return
+
+    if current_votes >= required_votes:
+        await execute_pause(f"⏸️ Vote passed (**{current_votes}/{required_votes}** of {eligible_count} listeners). **Paused**.")
+        return
+
+    await ctx.send(f"🗳️ Pause vote added (**{current_votes}/{required_votes}** of {eligible_count} listeners).")
+
+@bot.command()
+async def resume(ctx):
+    """Resumes the paused song."""
+    if not await ensure_voice_connected(ctx):
+        return
+
+    if not ctx.voice_client:
+        return
+
+    mode = get_command_mode('resume')
+    vote_cfg = settings.get_skip_vote_config()
+    force_vote_for_admin = vote_cfg.get('force_vote_for_admin', False)
+    
+    is_paused = ctx.voice_client.is_paused()
+    
+    async def execute_resume(msg):
+        clear_votes(ctx.guild.id, action_key='resume')
+        if is_paused:
+            ctx.voice_client.resume()
+            await ctx.send(msg)
+        else:
+            queue = get_music_queue(ctx.guild)
+            if queue and not ctx.voice_client.is_playing():
+                await ctx.send(msg)
+                async with get_play_next_lock(getattr(ctx.guild, 'id', None)):
+                    await play_next(ctx)
+            else:
+                await ctx.send("❌ Nothing to resume.")
+
+    if not is_paused and (not get_music_queue(ctx.guild) or ctx.voice_client.is_playing()):
+        await ctx.send("❌ Nothing is paused or stopped to resume.")
+        return
+
+    if is_admin_member(ctx.author) and not force_vote_for_admin:
+        await execute_resume("▶️ **Resumed** by admin.")
+        return
+
+    if mode == 'admin_only':
+        await ctx.send("❌ Only administrators can use this command.")
+        return
+
+    if mode == 'open':
+        await execute_resume("▶️ **Resumed**.")
+        return
+        
+    if vote_cfg['same_channel_only']:
+        if not ctx.author.voice or not ctx.voice_client.channel or ctx.author.voice.channel != ctx.voice_client.channel:
+            await ctx.send("❌ You must be in the same voice channel as the bot to vote.")
+            return
+            
+    required_votes, eligible_count = get_skip_vote_required_count(ctx)
+    votes, already_voted = register_vote(ctx.guild.id, 'resume', ctx.author.id)
+    current_votes = len(votes)
+
+    if already_voted:
+        await ctx.send(f"🗳️ You already voted to resume. Votes: **{current_votes}/{required_votes}**")
+        return
+
+    if current_votes >= required_votes:
+        await execute_resume(f"▶️ Vote passed (**{current_votes}/{required_votes}** of {eligible_count} listeners). **Resumed**.")
+        return
+
+    await ctx.send(f"🗳️ Resume vote added (**{current_votes}/{required_votes}** of {eligible_count} listeners).")
 
 @bot.command()
 async def stop(ctx):
@@ -2955,6 +3111,16 @@ async def setup_hook():
         _blacklist_patterns = load_yt_blacklist_patterns()
         ensure_loop_lag_monitor()
         load_state_from_disk()
+        
+        # Start API server
+        try:
+            import api
+            api.set_bot(bot)
+            api.start_api_server(host=getattr(settings, "API_HOST", "0.0.0.0"), port=getattr(settings, "API_PORT", 8000))
+            logger.info("API Server started successfully.")
+        except Exception as api_err:
+            logger.error(f"Failed to start API server: {api_err}", exc_info=True)
+
         logger.info(f"Initialized with {len(_blacklist_patterns)} blacklist patterns and persistent queue state.")
     except Exception as e:
         logger.error(f"Failed to initialize during setup_hook: {e}", exc_info=True)
@@ -2978,6 +3144,11 @@ async def main():
                 break
         except (KeyboardInterrupt, asyncio.CancelledError):
             logger.info("Received shutdown signal, shutting down gracefully...")
+            try:
+                import api
+                api.stop_api_server()
+            except Exception:
+                pass
             for gid, st in list(music_state_by_guild.items()):
                 cancel_voice_recovery(gid)
                 cancel_empty_voice_leave_timer(gid)
