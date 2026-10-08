@@ -92,6 +92,11 @@ PLAYBACK_DEBUG_METRICS = _get_env_bool(
     _get_bool(_config.get('playback', {}).get('debug_metrics', _playback_debug_default), _playback_debug_default),
 )
 YT_STREAM_CACHE_TTL_SECONDS = int(_config.get('playback', {}).get('yt_stream_cache_ttl_seconds', 300))
+PREBUFFER_SECONDS = float(_config.get('playback', {}).get('prebuffer_seconds', 1.5))
+LOG_BUFFER_METRICS = _get_env_bool(
+    'MUSICBOT_LOG_BUFFER_METRICS',
+    _get_bool(_config.get('playback', {}).get('log_buffer_metrics', False), False),
+)
 NORMALIZE_AUDIO = _get_bool(_config.get('playback', {}).get('normalize_audio', True), True)
 TARGET_LUFS = float(_config.get('playback', {}).get('target_lufs', -16.0))
 TRUE_PEAK = float(_config.get('playback', {}).get('true_peak', -1.5))
@@ -138,8 +143,9 @@ def get_ytdl_options():
     """Build yt-dlp format options from config."""
     ytdl_cfg = _config.get('ytdl_options', {})
     
+    DEFAULT_FORMAT = "ba[acodec=opus][abr<=96]/ba[abr<=96]/ba[acodec=opus][abr<=128]/bestaudio/best"
     options = {
-        'format': ytdl_cfg.get('format', 'bestaudio/best'),
+        'format': ytdl_cfg.get('format', DEFAULT_FORMAT),
         'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
         'restrictfilenames': True,
         'noplaylist': ytdl_cfg.get('noplaylist', True),

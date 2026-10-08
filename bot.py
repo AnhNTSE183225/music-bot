@@ -5,6 +5,7 @@ import sys
 import io
 import asyncio
 import threading
+import queue as pyqueue
 import signal
 import yt_dlp
 import re
@@ -99,6 +100,181 @@ class LoggingFFmpegPCMAudio(discord.FFmpegPCMAudio):
                     logger.warning(f"[ffmpeg] {line.decode('utf-8', 'ignore').strip()}")
                 except Exception:
                     pass
+
+
+class BufferedAudio(discord.AudioSource):
+    """Pre-buffers decoded PCM frames from an underlying AudioSource into RAM
+
+    to eliminate startup latency, speed fluctuations, and playback stutter.
+    """
+    def __init__(self, source: discord.AudioSource, buffer_duration: float = 1.5, max_buffer_duration: float = 10.0):
+        self.original = source
+        self.buffer_duration = max(0.2, float(buffer_duration))
+        # 50 frames per second (each frame is 20ms = 3840 bytes of 48kHz stereo 16-bit PCM)
+        self.min_buffer_frames = max(10, int(self.buffer_duration * 50))
+        self.max_buffer_frames = max(self.min_buffer_frames + 50, int(max_buffer_duration * 50))
+        
+        self.buffer = pyqueue.Queue(maxsize=self.max_buffer_frames)
+        self._stop_event = threading.Event()
+        self._ready_event = threading.Event()
+        self._eof_event = threading.Event()
+        
+        # Telemetry & Authoritative frame tracking
+        self.frames_read = 0        # Delivered to Discord
+        self.frames_decoded = 0     # Produced by FFmpeg
+        self.underrun_count = 0     # Buffer starved events
+        self.silence_count = 0      # Silence frames injected
+        self._last_log_time = time.time()
+        self._last_read_call_perf = time.perf_counter()
+        
+        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True, name="BufferedAudioReader")
+        self._reader_thread.start()
+
+    @property
+    def buffer_size(self):
+        return self.buffer.qsize()
+
+    def is_opus(self) -> bool:
+        return False
+
+    def _reader_loop(self):
+        if getattr(settings, 'LOG_BUFFER_METRICS', False):
+            logger.info(
+                f"[AudioBuffer] Reader started | Target pre-buffer: {self.min_buffer_frames} frames "
+                f"({self.buffer_duration:.2f}s) | Cap: {self.max_buffer_frames} frames ({self.max_buffer_frames * 0.02:.1f}s)"
+            )
+        try:
+            while not self._stop_event.is_set():
+                t0 = time.perf_counter()
+                data = self.original.read()
+                read_ms = (time.perf_counter() - t0) * 1000
+
+                if not data:
+                    if getattr(settings, 'LOG_BUFFER_METRICS', False):
+                        logger.info(
+                            f"[AudioBuffer] FFmpeg stream EOF reached. Total decoded: {self.frames_decoded} frames "
+                            f"({self.frames_decoded * 0.02:.1f}s)."
+                        )
+                    self._eof_event.set()
+                    self._ready_event.set()
+                    break
+
+                self.frames_decoded += 1
+                if getattr(settings, 'LOG_BUFFER_METRICS', False) and read_ms > 40.0:
+                    logger.warning(
+                        f"[AudioBuffer SLOW READ] FFmpeg read() took {read_ms:.1f}ms (>20ms). "
+                        f"Current buffer remaining: {self.buffer.qsize()} frames ({self.buffer.qsize() * 0.02:.2f}s)"
+                    )
+
+                # Push into buffer; retry with small timeout to stay responsive to stop_event
+                while not self._stop_event.is_set():
+                    try:
+                        self.buffer.put(data, timeout=0.1)
+                        break
+                    except pyqueue.Full:
+                        continue
+
+                if not self._ready_event.is_set() and self.buffer.qsize() >= self.min_buffer_frames:
+                    if getattr(settings, 'LOG_BUFFER_METRICS', False):
+                        logger.info(
+                            f"[AudioBuffer] Pre-buffer target reached: {self.buffer.qsize()} frames "
+                            f"({self.buffer.qsize() * 0.02:.2f}s) ready in RAM."
+                        )
+                    self._ready_event.set()
+        except Exception as e:
+            logger.error(f"[AudioBuffer] Reader error: {e}", exc_info=True)
+        finally:
+            self._eof_event.set()
+            self._ready_event.set()
+
+    async def wait_until_ready(self, timeout: float = 6.0):
+        """Asynchronously wait until target pre-buffer frames are gathered before starting playback."""
+        loop = asyncio.get_running_loop()
+        try:
+            await asyncio.wait_for(loop.run_in_executor(None, self._ready_event.wait, timeout), timeout=timeout + 0.5)
+        except Exception:
+            pass
+
+    def read(self) -> bytes:
+        if self._stop_event.is_set():
+            return b''
+
+        # If read() is called before wait_until_ready finished, wait briefly for buffer
+        if not self._ready_event.is_set():
+            self._ready_event.wait(timeout=2.0)
+
+        log_metrics = getattr(settings, 'LOG_BUFFER_METRICS', False)
+
+        now_perf = time.perf_counter()
+        call_interval_ms = (now_perf - self._last_read_call_perf) * 1000
+        self._last_read_call_perf = now_perf
+
+        # Detect if Discord's AudioPlayer thread is bursting / catching up
+        if log_metrics and self.frames_read > 5 and call_interval_ms < 5.0:
+            logger.warning(
+                f"[AudioBuffer BURST] Discord called read() rapidly after {call_interval_ms:.1f}ms (<20ms). "
+                f"Discord player is catching up! Buffer remaining: {self.buffer.qsize()} frames."
+            )
+
+        # Periodic log every 2 seconds during playback
+        now = time.time()
+        if log_metrics and (now - self._last_log_time >= 2.0):
+            self._last_log_time = now
+            qlen = self.buffer.qsize()
+            qsec = qlen * 0.02
+            logger.info(
+                f"[AudioBuffer] Buffered: {qlen} frames ({qsec:.2f}s) | "
+                f"Decoded: {self.frames_decoded} | Played: {self.frames_read} | "
+                f"Underruns: {self.underrun_count}"
+            )
+
+        try:
+            data = self.buffer.get_nowait()
+            if data:
+                self.frames_read += 1
+            return data
+        except pyqueue.Empty:
+            if self._eof_event.is_set():
+                return b''
+            self.underrun_count += 1
+            if log_metrics:
+                logger.warning(
+                    f"[AudioBuffer UNDERRUN #{self.underrun_count}] Buffer empty! "
+                    f"Decoded: {self.frames_decoded}, Played: {self.frames_read}. Waiting up to 20ms..."
+                )
+            # Buffer starvation: wait up to 20ms for next frame from reader
+            try:
+                data = self.buffer.get(timeout=0.02)
+                if data:
+                    self.frames_read += 1
+                return data
+            except pyqueue.Empty:
+                if self._eof_event.is_set():
+                    return b''
+                self.silence_count += 1
+                if log_metrics:
+                    logger.error(
+                        f"[AudioBuffer SILENCE #{self.silence_count}] Buffer starved for >20ms! "
+                        f"Injecting 20ms silence frame. (Decoded: {self.frames_decoded}, Played: {self.frames_read})"
+                    )
+                self.frames_read += 1
+                return b'\x00' * 3840
+
+    def cleanup(self):
+        self._stop_event.set()
+        self._ready_event.set()
+        # Drain buffer so reader thread does not block on put()
+        try:
+            while not self.buffer.empty():
+                self.buffer.get_nowait()
+        except Exception:
+            pass
+        if hasattr(self.original, 'cleanup'):
+            try:
+                self.original.cleanup()
+            except Exception as e:
+                logger.debug(f"Error in original source cleanup: {e}")
+
 
 intents = discord.Intents.all()
 
@@ -1619,15 +1795,41 @@ async def play_next(ctx):
         else:
             raise ValueError(f"Unknown song type: {song['type']}")
 
+        # 1.5 Apply pre-playback buffer to prevent initial speed fluctuation & jitter
+        buffered = None
+        if getattr(settings, 'PREBUFFER_SECONDS', 0) > 0:
+            buffered = BufferedAudio(source, buffer_duration=settings.PREBUFFER_SECONDS)
+            source = buffered
+
         # 2. Apply Volume Transformer
         source = discord.PCMVolumeTransformer(source)
         source.volume = get_music_volume(ctx.guild)
+
+        # Pre-fill buffer before starting Discord audio loop
+        if buffered:
+            prebuf_start = time.perf_counter()
+            await buffered.wait_until_ready(timeout=6.0)
+            prebuf_ms = int((time.perf_counter() - prebuf_start) * 1000)
+            if getattr(settings, 'LOG_BUFFER_METRICS', False):
+                logger.info(f"Pre-buffered {buffered.buffer_size} frames ({prebuf_ms}ms) for: {song.get('title')}")
+            log_playback_metric(
+                "prebuffer_complete",
+                queue_id=song.get('queue_id'),
+                frames=buffered.buffer_size,
+                wait_ms=prebuf_ms,
+            )
 
         # 3. Play - double check connection and playback state before playing
         if ctx.voice_client and ctx.voice_client.is_connected():
             if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
                 # Another call started playback while we were preparing this source.
+                source.cleanup()
                 queue.insert(0, song)
+                return
+
+            current_state = get_music_state(ctx.guild)
+            if not current_state or current_state.get('manual_stop') or bot.is_closed():
+                source.cleanup()
                 return
 
             playback_started = time.perf_counter()
@@ -1706,6 +1908,7 @@ async def play_next(ctx):
                 f"(requested by {song.get('requester_mention', 'unknown')}, Vol: {int(get_music_volume(ctx.guild) * 100)}%)"
             )
         else:
+            source.cleanup()
             logger.warning("Lost connection before playing")
             queue.insert(0, song)  # Put song back in queue
             await ctx.send("❌ Lost voice connection")

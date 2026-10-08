@@ -17,6 +17,8 @@ playback:
   connection_stabilize_delay: 1.5
   debug_metrics: false  # usually auto-overridden by runtime.mode in run.ps1
   yt_stream_cache_ttl_seconds: 300
+  prebuffer_seconds: 1.5      # Pre-buffer in RAM before starting audio stream (prevents initial speed bursts and stutters)
+  log_buffer_metrics: false   # Detailed real-time audio buffer telemetry in console/logs (default: false)
   normalize_audio: true       # EBU R128 loudness normalization (solves quiet/loud tracks)
   target_lufs: -16.0          # Integrated loudness target in LUFS (-14 to -16 LUFS is standard for music)
   true_peak: -1.5             # Maximum true peak in dBTP to prevent digital clipping
@@ -62,7 +64,8 @@ storage:
 
 # YouTube Downloader Options
 ytdl_options:
-  format: "bestaudio/best"
+  # Optimized for Discord's 64kbps voice bitrate: prefers 60-96kbps Opus (format 250) for 2x faster downloads and stutter-free streaming
+  format: "ba[acodec=opus][abr<=96]/ba[abr<=96]/ba[acodec=opus][abr<=128]/bestaudio/best"
   noplaylist: true
   quiet: true
   no_warnings: true
