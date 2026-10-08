@@ -206,6 +206,17 @@ def get_simulated_context(guild, user_data):
         member.name = user_data["user"]["username"]
         member.display_name = user_data["user"]["username"]
 
+        avatar_hash = user_data.get("user", {}).get("avatar")
+        if avatar_hash:
+            avatar_url = f"https://cdn.discordapp.com/avatars/{user_id}/{avatar_hash}.png?size=64"
+            class SimulatedAvatar:
+                def __init__(self, u):
+                    self.url = u
+                def __str__(self):
+                    return self.url
+            member.display_avatar = SimulatedAvatar(avatar_url)
+            member.avatar = SimulatedAvatar(avatar_url)
+
     # Use a generic channel or text channel from state
     state = bot_module.get_music_state(guild)
     text_channel = guild.get_channel(state.get("text_channel_id")) if state else None
@@ -223,16 +234,38 @@ def format_song_for_api(song, guild):
     if not song:
         return None
     song_copy = dict(song)
-    if not song_copy.get('requester_avatar') and song_copy.get('requester_id') and guild:
-        try:
-            member = guild.get_member(song_copy['requester_id'])
-            if member:
-                if hasattr(member, 'display_avatar') and member.display_avatar:
-                    song_copy['requester_avatar'] = str(member.display_avatar.url)
-                elif hasattr(member, 'avatar') and member.avatar:
-                    song_copy['requester_avatar'] = str(member.avatar.url)
-        except Exception:
-            pass
+    if not song_copy.get('requester_avatar') and song_copy.get('requester_id'):
+        requester_id = song_copy['requester_id']
+        # 1. Check guild member cache
+        if guild:
+            try:
+                member = guild.get_member(requester_id)
+                if member:
+                    if hasattr(member, 'display_avatar') and member.display_avatar:
+                        song_copy['requester_avatar'] = str(member.display_avatar.url)
+                    elif hasattr(member, 'avatar') and member.avatar:
+                        song_copy['requester_avatar'] = str(member.avatar.url)
+            except Exception:
+                pass
+        # 2. Check bot global user cache
+        if not song_copy.get('requester_avatar') and bot_instance:
+            try:
+                user_obj = bot_instance.get_user(int(requester_id))
+                if user_obj and hasattr(user_obj, 'display_avatar') and user_obj.display_avatar:
+                    song_copy['requester_avatar'] = str(user_obj.display_avatar.url)
+            except Exception:
+                pass
+        # 3. Check active OAuth sessions
+        if not song_copy.get('requester_avatar'):
+            try:
+                req_str = str(requester_id)
+                for sess in SESSIONS.values():
+                    u = sess.get("user", {})
+                    if str(u.get("id")) == req_str and u.get("avatar"):
+                        song_copy['requester_avatar'] = f"https://cdn.discordapp.com/avatars/{req_str}/{u['avatar']}.png?size=64"
+                        break
+            except Exception:
+                pass
     return song_copy
 
 @app.get("/api/queue/{guild_id}")
@@ -298,7 +331,7 @@ async def stream_queue(guild_id: str, request: Request):
     
     async def event_generator():
         while True:
-            if is_shutting_down or await request.is_disconnected():
+            if is_shutting_down or (_api_server and _api_server.should_exit) or await request.is_disconnected():
                 break
             try:
                 state = bot_module.get_music_state(guild)
@@ -509,18 +542,46 @@ async def change_volume(guild_id: str, req: VolumeRequest, user: dict = Depends(
         raise HTTPException(status_code=500, detail=str(e))
 
 _api_server = None
+_api_task = None
 
 def start_api_server(host="0.0.0.0", port=8000):
-    global _api_server
+    global _api_server, _api_task, is_shutting_down
+    if _api_task and not _api_task.done():
+        logger.info("API server is already running.")
+        return
+    is_shutting_down = False
     import uvicorn
     # Pass log_config=None so Uvicorn uses the bot's existing UTF-8 logging setup
     # instead of closing sys.stdout and overwriting existing loggers.
-    config = uvicorn.Config(app, host=host, port=port, log_config=None)
+    # Set timeout_graceful_shutdown=1 so Uvicorn will not hang indefinitely on open SSE connections.
+    config = uvicorn.Config(
+        app,
+        host=host,
+        port=port,
+        log_config=None,
+        timeout_graceful_shutdown=1,
+    )
     _api_server = uvicorn.Server(config)
-    asyncio.create_task(_api_server.serve())
+    _api_task = asyncio.create_task(_api_server.serve())
 
 def stop_api_server():
     global _api_server, is_shutting_down
     is_shutting_down = True
     if _api_server:
         _api_server.should_exit = True
+
+async def wait_api_server_shutdown(timeout=2.0):
+    global _api_task, _api_server, is_shutting_down
+    is_shutting_down = True
+    if _api_server:
+        _api_server.should_exit = True
+    if _api_task and not _api_task.done():
+        try:
+            await asyncio.wait_for(_api_task, timeout=timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+            _api_task.cancel()
+            try:
+                await asyncio.wait_for(_api_task, timeout=1.0)
+            except Exception:
+                pass
+

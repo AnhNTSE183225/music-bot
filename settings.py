@@ -153,21 +153,44 @@ def get_ytdl_options():
         'geo_bypass': ytdl_cfg.get('geo_bypass', True),
     }
     
-    # Handle extractor_args if present
+    # Support cookies file if specified in config, environment, or present in project root
+    cookie_file = ytdl_cfg.get('cookiefile') or os.getenv('YTDL_COOKIEFILE')
+    if not cookie_file and os.path.exists('cookies.txt'):
+        cookie_file = 'cookies.txt'
+    if cookie_file and os.path.exists(cookie_file):
+        options['cookiefile'] = cookie_file
+
+    # Handle extractor_args (convert config strings into yt-dlp Python API dictionary structure)
+    formatted_extractor_args = {}
     if 'extractor_args' in ytdl_cfg and ytdl_cfg['extractor_args']:
-        extractor_args = {}
-        for extractor, args_list in ytdl_cfg['extractor_args'].items():
-            if isinstance(args_list, list):
-                # Convert list of "key=value" strings to dict
-                extractor_args[extractor] = {}
-                for arg in args_list:
-                    if '=' in arg:
-                        key, value = arg.split('=', 1)
-                        extractor_args[extractor][key] = value
-            else:
-                extractor_args[extractor] = args_list
-        options['extractor_args'] = {'youtube': [f'player_client={extractor_args.get("youtube", {}).get("player_client", "android")}']}
-    
+        for extractor, args in ytdl_cfg['extractor_args'].items():
+            formatted_extractor_args[extractor] = {}
+            if isinstance(args, list):
+                for item in args:
+                    if '=' in item:
+                        k, v = item.split('=', 1)
+                        vals = [x.strip() for x in v.split(',') if x.strip()]
+                        formatted_extractor_args[extractor][k.strip()] = vals
+                    else:
+                        formatted_extractor_args[extractor][item.strip()] = []
+            elif isinstance(args, dict):
+                for k, v in args.items():
+                    if isinstance(v, list):
+                        formatted_extractor_args[extractor][k] = v
+                    elif isinstance(v, str):
+                        formatted_extractor_args[extractor][k] = [x.strip() for x in v.split(',') if x.strip()]
+                    else:
+                        formatted_extractor_args[extractor][k] = [v]
+
+    # Ensure youtube player_client defaults to mobile clients (android, ios) to bypass web bot checks
+    if 'youtube' not in formatted_extractor_args:
+        formatted_extractor_args['youtube'] = {}
+    if 'player_client' not in formatted_extractor_args['youtube']:
+        formatted_extractor_args['youtube']['player_client'] = ['android', 'ios']
+
+    options['extractor_args'] = formatted_extractor_args
+    options['js_runtimes'] = {'node': {}}
+
     return options
 
 def get_playlist_ytdl_options():

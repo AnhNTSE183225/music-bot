@@ -5,6 +5,7 @@ import sys
 import io
 import asyncio
 import threading
+import signal
 import yt_dlp
 import re
 import json
@@ -954,8 +955,14 @@ def start_console_command_bridge():
                     # stdin closed or other readline error
                     break
         except KeyboardInterrupt:
-            # Handle Ctrl+C in reader thread
-            pass
+            # Handle Ctrl+C in reader thread: trigger clean shutdown
+            if current_loop and current_loop.is_running():
+                try:
+                    current_loop.call_soon_threadsafe(
+                        lambda: asyncio.create_task(perform_graceful_shutdown())
+                    )
+                except RuntimeError:
+                    pass
         finally:
             # Signal the stop event to ensure clean shutdown
             console_input_thread_stop.set()
@@ -3166,6 +3173,43 @@ async def setup_hook():
     except Exception as e:
         logger.error(f"Failed to initialize during setup_hook: {e}", exc_info=True)
 
+_shutdown_lock = False
+
+async def perform_graceful_shutdown():
+    global _shutdown_lock
+    if _shutdown_lock:
+        return
+    _shutdown_lock = True
+    logger.info("Received shutdown signal, shutting down gracefully...")
+    try:
+        import api
+        if hasattr(api, 'wait_api_server_shutdown'):
+            await api.wait_api_server_shutdown(timeout=2.0)
+        else:
+            api.stop_api_server()
+    except Exception as e:
+        logger.warning(f"Error stopping API server: {e}")
+
+    for gid, st in list(music_state_by_guild.items()):
+        try:
+            cancel_voice_recovery(gid)
+            cancel_empty_voice_leave_timer(gid)
+            st['manual_stop'] = True
+            st['is_playing'] = False
+            st['was_playing'] = False
+            st['voice_channel_id'] = None
+            st['saved_at'] = time.time()
+        except Exception:
+            pass
+
+    save_state_to_disk()
+
+    try:
+        if not bot.is_closed():
+            await bot.close()
+    except Exception:
+        pass
+
 # Main bot startup
 async def main():
     if not TOKEN:
@@ -3177,6 +3221,29 @@ async def main():
     logger.info("Starting MusicBot...")
     retry_delay = settings.RECONNECT_DELAY_INITIAL
 
+    def handle_signal(sig, frame):
+        logger.info(f"Signal {sig} received, triggering graceful shutdown...")
+        try:
+            loop = asyncio.get_running_loop()
+            if loop and loop.is_running():
+                loop.call_soon_threadsafe(lambda: asyncio.create_task(perform_graceful_shutdown()))
+        except RuntimeError:
+            pass
+
+    try:
+        signal.signal(signal.SIGINT, handle_signal)
+    except Exception:
+        pass
+    try:
+        signal.signal(signal.SIGTERM, handle_signal)
+    except Exception:
+        pass
+    if hasattr(signal, 'SIGBREAK'):
+        try:
+            signal.signal(signal.SIGBREAK, handle_signal)
+        except Exception:
+            pass
+
     while True:
         try:
             start_console_command_bridge()
@@ -3184,25 +3251,7 @@ async def main():
             if bot.is_closed():
                 break
         except (KeyboardInterrupt, asyncio.CancelledError):
-            logger.info("Received shutdown signal, shutting down gracefully...")
-            try:
-                import api
-                api.stop_api_server()
-            except Exception:
-                pass
-            for gid, st in list(music_state_by_guild.items()):
-                cancel_voice_recovery(gid)
-                cancel_empty_voice_leave_timer(gid)
-                st['manual_stop'] = True
-                st['is_playing'] = False
-                st['was_playing'] = False
-                st['voice_channel_id'] = None
-                st['saved_at'] = time.time()
-            try:
-                if not bot.is_closed():
-                    await bot.close()
-            except Exception:
-                pass
+            await perform_graceful_shutdown()
             break
         except Exception as e:
             if not settings.AUTO_RECONNECT:

@@ -123,7 +123,19 @@ Write-Host ""
 # Add venv to PATH so yt-dlp can find node.exe
 $env:PATH = "$((Resolve-Path .\venv\Scripts).Path);$env:PATH"
 
+# Check and clean up orphaned MusicBot processes before launch
+$oldProcesses = Get-CimInstance Win32_Process | Where-Object { 
+    $_.ProcessId -ne $PID -and $_.Name -like "python*.exe" -and $_.CommandLine -like "*bot.py*"
+}
+foreach ($p in $oldProcesses) {
+    Write-Host "Found existing MusicBot process (PID $($p.ProcessId)). Terminating it..." -ForegroundColor Yellow
+    Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+}
+
 # Run the bot
 & "$venvPython" ".\bot.py"
+$botExit = $LASTEXITCODE
 
-Read-Host "Press Enter to exit..."
+if ($botExit -ne 0 -and $botExit -ne 130) {
+    Read-Host "Press Enter to exit..."
+}

@@ -72,7 +72,7 @@ ytdl_options:
   geo_bypass: true
   extractor_args:
     youtube:
-      - "player_client=android"
+      - "player_client=android,ios"
 
 # FFmpeg Stream Options
 ffmpeg:

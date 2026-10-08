@@ -135,7 +135,22 @@ fi
 
 echo ""
 
+# Check and clean up orphaned MusicBot processes before launch
+if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" || "$OSTYPE" == "win32" ]]; then
+    OLD_PIDS=$(powershell.exe -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { \$_.CommandLine -like '*bot.py*' } | Select-Object -ExpandProperty ProcessId" 2>/dev/null)
+    for p in $OLD_PIDS; do
+        p=$(echo "$p" | tr -d '\r\n')
+        if [ -n "$p" ] && [ "$p" != "$$" ]; then
+            echo -e "\e[33mFound existing MusicBot process (PID $p). Terminating it...\e[0m"
+            taskkill.exe //F //PID "$p" 2>/dev/null
+        fi
+    done
+fi
+
 # Run the bot
 $VENV_PYTHON ./bot.py
+BOT_EXIT=$?
 
-read -p "Press Enter to exit..."
+if [ $BOT_EXIT -ne 0 ] && [ $BOT_EXIT -ne 130 ]; then
+    read -p "Press Enter to exit..."
+fi
