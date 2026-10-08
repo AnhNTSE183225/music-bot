@@ -382,3 +382,8 @@ API_HOST = os.getenv('MUSICBOT_API_HOST', _config.get('api', {}).get('host', '0.
 API_PORT = int(os.getenv('MUSICBOT_API_PORT', _config.get('api', {}).get('port', 8000)))
 FRONTEND_URL = os.getenv('MUSICBOT_FRONTEND_URL', _config.get('api', {}).get('frontend_url', 'http://localhost:3000'))
 DISCORD_REDIRECT_URI = os.getenv('MUSICBOT_DISCORD_REDIRECT_URI', _config.get('api', {}).get('discord_redirect_uri', 'http://localhost:8000/callback'))
+DISCORD_CLIENT_ID = os.getenv('DISCORD_CLIENT_ID', _config.get('api', {}).get('client_id'))
+DISCORD_CLIENT_SECRET = os.getenv('DISCORD_CLIENT_SECRET', _config.get('api', {}).get('client_secret'))
+CORS_ORIGINS = _config.get('api', {}).get('cors_origins', [])
+EMPTY_VOICE_LEAVE_DELAY_SECONDS = int(os.getenv('MUSICBOT_EMPTY_VOICE_LEAVE_DELAY_SECONDS', _config.get('playback', {}).get('empty_voice_leave_delay_seconds', 10)))
+

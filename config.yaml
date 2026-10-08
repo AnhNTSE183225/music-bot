@@ -94,10 +94,6 @@ permissions:
 
     join:
       mode: "open"
-
-    play:
-      mode: "admin_only"
-
     yt:
       mode: "open"
 
@@ -129,13 +125,13 @@ permissions:
       mode: "vote_if_non_admin"
 
     skipto:
-      mode: "vote_if_non_admin"
+      mode: "admin_only"
 
     clear:
       mode: "admin_only"
 
     stop:
-      mode: "open"
+      mode: "vote_if_non_admin"
 
     pause:
       mode: "vote_if_non_admin"
@@ -172,4 +168,9 @@ api:
   host: "0.0.0.0"
   port: 8000
   frontend_url: "http://localhost:8080"
+  cors_origins:
+    - "http://localhost:8080"
+    - "http://localhost:3000"
+    - "http://127.0.0.1:3000"
+    - "http://127.0.0.1:8080"
   discord_redirect_uri: "http://localhost:8000/callback"

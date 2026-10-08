@@ -6,7 +6,6 @@ import io
 import asyncio
 import threading
 import yt_dlp
-import difflib
 import re
 import json
 from dotenv import load_dotenv
@@ -72,8 +71,6 @@ if not TOKEN:
     TOKEN = None
 
 # --- SETUP ---
-import subprocess
-import threading
 
 class LoggingFFmpegPCMAudio(discord.FFmpegPCMAudio):
     def __init__(self, *args, **kwargs):
@@ -132,7 +129,7 @@ votes_by_guild = {}
 active_playlist_prompts_by_guild = {}
 next_queue_id = 1
 empty_voice_leave_tasks = {}
-EMPTY_VOICE_LEAVE_DELAY_SECONDS = 10
+EMPTY_VOICE_LEAVE_DELAY_SECONDS = getattr(settings, 'EMPTY_VOICE_LEAVE_DELAY_SECONDS', 10)
 playback_monitor_tasks = {}
 loop_lag_monitor_task = None
 console_command_queue = None
@@ -846,7 +843,7 @@ async def dispatch_console_command(raw_line):
     ctx.send = send
 
     async def run_command():
-        if command_name in {'play', 'yt', 'playlist', 'pl', 'blacklist'}:
+        if command_name in {'yt', 'playlist', 'pl', 'blacklist'}:
             query = command_line[len(command_name):].strip()
             if command_name == 'blacklist':
                 await command.callback(ctx, pattern=(query or None))
@@ -1216,14 +1213,25 @@ async def ensure_voice_connected(ctx):
 def make_song(song_type, title, data, requester):
     """Create a queue song object with requester metadata."""
     global next_queue_id
+    avatar_url = None
+    if requester:
+        try:
+            if hasattr(requester, 'display_avatar') and requester.display_avatar:
+                avatar_url = str(requester.display_avatar.url)
+            elif hasattr(requester, 'avatar') and requester.avatar:
+                avatar_url = str(requester.avatar.url)
+        except Exception:
+            avatar_url = None
+
     song = {
         'queue_id': next_queue_id,
         'type': song_type,
         'title': title,
         'data': data,
-        'requester_id': requester.id,
-        'requester_mention': requester.mention,
-        'requester_handle': str(requester),
+        'requester_id': requester.id if requester else None,
+        'requester_mention': requester.mention if requester else 'Unknown',
+        'requester_handle': str(requester) if requester else 'Unknown',
+        'requester_avatar': avatar_url,
         'enqueued_perf': time.perf_counter(),
     }
     next_queue_id += 1
@@ -1424,7 +1432,10 @@ def register_vote(guild_id, action_key, user_id):
     guild_votes = votes_by_guild.setdefault(guild_id, {})
     votes = guild_votes.setdefault(action_key, set())
     already_voted = user_id in votes
-    votes.add(user_id)
+    if already_voted:
+        votes.remove(user_id)
+    else:
+        votes.add(user_id)
     return votes, already_voted
 
 def get_skip_votes_info(guild, action_key='skip'):
@@ -2386,7 +2397,7 @@ async def skip(ctx):
     current_votes = len(votes)
 
     if already_voted:
-        await ctx.send(f"🗳️ You already voted to skip. Votes: **{current_votes}/{required_votes}**")
+        await ctx.send(f"🗳️ You removed your vote to skip. Votes: **{current_votes}/{required_votes}**")
         return
 
     if current_votes >= required_votes:
@@ -2738,7 +2749,7 @@ async def pause(ctx):
     current_votes = len(votes)
 
     if already_voted:
-        await ctx.send(f"🗳️ You already voted to pause. Votes: **{current_votes}/{required_votes}**")
+        await ctx.send(f"🗳️ You removed your vote to pause. Votes: **{current_votes}/{required_votes}**")
         return
 
     if current_votes >= required_votes:
@@ -2802,7 +2813,7 @@ async def resume(ctx):
     current_votes = len(votes)
 
     if already_voted:
-        await ctx.send(f"🗳️ You already voted to resume. Votes: **{current_votes}/{required_votes}**")
+        await ctx.send(f"🗳️ You removed your vote to resume. Votes: **{current_votes}/{required_votes}**")
         return
 
     if current_votes >= required_votes:
@@ -2814,44 +2825,81 @@ async def resume(ctx):
 @bot.command()
 async def stop(ctx):
     """Stops playback and disconnects from voice channel."""
-    if not await enforce_command_access(ctx, 'stop'):
+    if not await ensure_voice_connected(ctx):
         return
 
-    guild_id = getattr(ctx.guild, 'id', None)
-    if guild_id:
-        cancel_voice_recovery(guild_id)
-        cancel_empty_voice_leave_timer(guild_id)
-        clear_votes(guild_id)
-        cancel_playback_monitor(guild_id)
+    mode = get_command_mode('stop')
+    vote_cfg = settings.get_skip_vote_config()
+    force_vote_for_admin = vote_cfg.get('force_vote_for_admin', False)
 
-    state = get_music_state(ctx.guild)
-    if state:
-        state['manual_stop'] = True
-        state['is_playing'] = False
-        state['was_playing'] = False
-        state['voice_channel_id'] = None
-        state['text_channel_id'] = None
-        state['saved_at'] = time.time()
-
-    clear_music_state(ctx.guild)
-
-    if ctx.voice_client:
-        ctx.voice_client.stop()
-        try:
-            await asyncio.wait_for(ctx.voice_client.disconnect(force=True), timeout=5.0)
-        except Exception as e:
-            logger.warning("Stop disconnect timed out/failed: %s", e)
+    async def execute_stop(msg):
+        guild_id = getattr(ctx.guild, 'id', None)
         if guild_id:
             cancel_voice_recovery(guild_id)
-        await clear_bot_status_if_idle()
-        await ctx.send("🛑 Stopped and disconnected.")
-    else:
-        await ctx.send("❌ Not connected to a voice channel.")
+            cancel_empty_voice_leave_timer(guild_id)
+            clear_votes(guild_id)
+            cancel_playback_monitor(guild_id)
 
+        state = get_music_state(ctx.guild)
+        if state:
+            state['manual_stop'] = True
+            state['is_playing'] = False
+            state['was_playing'] = False
+            state['voice_channel_id'] = None
+            state['text_channel_id'] = None
+            state['saved_at'] = time.time()
+
+        clear_music_state(ctx.guild)
+
+        if ctx.voice_client:
+            ctx.voice_client.stop()
+            try:
+                await asyncio.wait_for(ctx.voice_client.disconnect(force=True), timeout=5.0)
+            except Exception as e:
+                logger.warning("Stop disconnect timed out/failed: %s", e)
+            if guild_id:
+                cancel_voice_recovery(guild_id)
+            await clear_bot_status_if_idle()
+            await ctx.send(msg)
+        else:
+            await ctx.send("❌ Not connected to a voice channel.")
+
+    if is_admin_member(ctx.author) and not force_vote_for_admin:
+        await execute_stop("🛑 Stopped by admin.")
+        return
+
+    if mode == 'admin_only':
+        await ctx.send("❌ Only administrators can use this command.")
+        return
+
+    if mode == 'open':
+        await execute_stop("🛑 Stopped and disconnected.")
+        return
+
+    if vote_cfg['same_channel_only']:
+        if not ctx.author.voice or not ctx.voice_client.channel or ctx.author.voice.channel != ctx.voice_client.channel:
+            await ctx.send("❌ You must be in the same voice channel as the bot to vote stop.")
+            return
+
+    required_votes, eligible_count = get_skip_vote_required_count(ctx)
+    votes, already_voted = register_vote(ctx.guild.id, 'stop', ctx.author.id)
+    current_votes = len(votes)
+
+    if already_voted:
+        await ctx.send(f"🗳️ You removed your vote to stop. Votes: **{current_votes}/{required_votes}**")
+        return
+
+    if current_votes >= required_votes:
+        await execute_stop(f"🛑 Vote passed (**{current_votes}/{required_votes}** of {eligible_count} listeners). Stopping.")
+        return
+
+    await ctx.send(f"🗳️ Stop vote added (**{current_votes}/{required_votes}** of {eligible_count} listeners).")
 
 @bot.command()
 async def remove(ctx, index: int):
     """Removes a song from queue by index. Owner/admin can remove directly; others require vote."""
+    mode = get_command_mode('remove')
+
     queue = get_music_queue(ctx.guild)
     if not queue:
         await ctx.send("❌ The queue is empty.")
@@ -2867,21 +2915,32 @@ async def remove(ctx, index: int):
     is_admin = is_admin_member(ctx.author)
     is_owner = target.get('requester_id') == ctx.author.id
 
-    if (is_admin and not force_vote_for_admin) or is_owner:
-        removed_song = queue.pop(index - 1)
+    async def execute_remove(msg, current_index):
+        removed_song = queue.pop(current_index)
         music_state = get_music_state(ctx.guild)
         if music_state:
             curr = music_state.get('queue_index', -1)
-            if index - 1 < curr:
+            if current_index < curr:
                 music_state['queue_index'] -= 1
-            elif index - 1 == curr:
-                music_state['next_index'] = index - 1
+            elif current_index == curr:
+                music_state['next_index'] = current_index
                 if ctx.voice_client and ctx.voice_client.is_playing():
                     ctx.voice_client.stop()
             save_state_to_disk()
         if ctx.guild:
             clear_votes(ctx.guild.id, action_key=f"remove:{removed_song['queue_id']}")
-        await ctx.send(f"🗑️ Removed `#{index}`: **{removed_song['title']}**")
+        await ctx.send(f"{msg} Removed `#{index}`: **{removed_song['title']}**")
+
+    if (is_admin and not force_vote_for_admin) or is_owner:
+        await execute_remove("✅", index - 1)
+        return
+
+    if mode == 'admin_only':
+        await ctx.send("❌ Only administrators can use this command.")
+        return
+        
+    if mode == 'open':
+        await execute_remove("✅", index - 1)
         return
 
     if vote_cfg['same_channel_only']:
@@ -2895,38 +2954,20 @@ async def remove(ctx, index: int):
     current_votes = len(votes)
 
     if already_voted:
-        await ctx.send(f"🗳️ You already voted to remove `#{index}`. Votes: **{current_votes}/{required_votes}**")
+        await ctx.send(f"🗳️ You removed your vote to remove `#{index}`. Votes: **{current_votes}/{required_votes}**")
         return
 
     if current_votes >= required_votes:
         current_index = next((i for i, s in enumerate(queue) if s.get('queue_id') == target['queue_id']), None)
         if current_index is None:
             clear_votes(ctx.guild.id, action_key=action_key)
-            await ctx.send("ℹ️ That song is no longer in the queue.")
+            await ctx.send("⚠️ That song is no longer in the queue.")
             return
 
-        removed_song = queue.pop(current_index)
-        music_state = get_music_state(ctx.guild)
-        if music_state:
-            curr = music_state.get('queue_index', -1)
-            if current_index < curr:
-                music_state['queue_index'] -= 1
-            elif current_index == curr:
-                music_state['next_index'] = current_index
-                if ctx.voice_client and ctx.voice_client.is_playing():
-                    ctx.voice_client.stop()
-            save_state_to_disk()
-        clear_votes(ctx.guild.id, action_key=action_key)
-        await ctx.send(
-            f"🗑️ Vote passed (**{current_votes}/{required_votes}** of {eligible_count} listeners). "
-            f"Removed **{removed_song['title']}**."
-        )
+        await execute_remove(f"✅ Vote passed (**{current_votes}/{required_votes}** of {eligible_count} listeners).", current_index)
         return
 
-    await ctx.send(
-        f"🗳️ Remove vote added for `#{index}` (**{current_votes}/{required_votes}** of {eligible_count} listeners)."
-    )
-
+    await ctx.send(f"🗳️ Remove vote added for `#{index}` (**{current_votes}/{required_votes}** of {eligible_count} listeners).")
 
 @bot.command()
 async def block(ctx, user_id: int = None):

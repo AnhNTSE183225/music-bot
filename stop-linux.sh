@@ -10,9 +10,17 @@ if [ -f bot.pid ]; then
         echo -e "\e[33mStopping MusicBot (PID $BOT_PID)...\e[0m"
         kill $BOT_PID
         
-        # Wait for the process to exit cleanly
+        # Wait for the process to exit cleanly with timeout fallback
+        WAIT_COUNT=0
+        TIMEOUT=8
         while kill -0 $BOT_PID 2>/dev/null; do
             sleep 1
+            WAIT_COUNT=$((WAIT_COUNT + 1))
+            if [ $WAIT_COUNT -ge $TIMEOUT ]; then
+                echo -e "\e[31mMusicBot did not exit cleanly within ${TIMEOUT}s. Force killing (SIGKILL)...\e[0m"
+                kill -9 $BOT_PID 2>/dev/null
+                break
+            fi
         done
         echo -e "\e[32mMusicBot stopped successfully.\e[0m"
     else
@@ -32,9 +40,17 @@ if [ -f tailscale_funnel.pid ]; then
         echo -e "\e[33mStopping Tailscale Funnel (PID $TS_PID)...\e[0m"
         sudo kill $TS_PID
         
-        # Wait for the process to exit cleanly
+        # Wait for the process to exit cleanly with timeout fallback
+        WAIT_COUNT=0
+        TIMEOUT=8
         while sudo kill -0 $TS_PID 2>/dev/null; do
             sleep 1
+            WAIT_COUNT=$((WAIT_COUNT + 1))
+            if [ $WAIT_COUNT -ge $TIMEOUT ]; then
+                echo -e "\e[31mTailscale Funnel did not exit cleanly within ${TIMEOUT}s. Force killing (SIGKILL)...\e[0m"
+                sudo kill -9 $TS_PID 2>/dev/null
+                break
+            fi
         done
         echo -e "\e[32mTailscale Funnel stopped successfully.\e[0m"
     else

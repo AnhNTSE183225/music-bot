@@ -6,7 +6,7 @@ import urllib.parse
 
 from fastapi import FastAPI, Request, Response, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 import json
 from pydantic import BaseModel
 import httpx
@@ -32,12 +32,12 @@ def set_bot(bot):
     global bot_instance
     bot_instance = bot
 
-DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
-DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
+DISCORD_CLIENT_ID = getattr(settings, "DISCORD_CLIENT_ID", None) or os.getenv("DISCORD_CLIENT_ID")
+DISCORD_CLIENT_SECRET = getattr(settings, "DISCORD_CLIENT_SECRET", None) or os.getenv("DISCORD_CLIENT_SECRET")
 DISCORD_REDIRECT_URI = getattr(settings, "DISCORD_REDIRECT_URI", "http://localhost:8000/callback")
 FRONTEND_URL = getattr(settings, "FRONTEND_URL", "http://localhost:3000")
 
-frontend_origin = "http://localhost:3000"
+frontend_origin = ""
 if FRONTEND_URL:
     try:
         parsed = urllib.parse.urlparse(FRONTEND_URL)
@@ -45,9 +45,15 @@ if FRONTEND_URL:
     except:
         pass
 
+cors_origins = list(getattr(settings, "CORS_ORIGINS", []) or [])
+if frontend_origin and frontend_origin not in cors_origins:
+    cors_origins.append(frontend_origin)
+if not cors_origins:
+    cors_origins = ["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:8080", "http://127.0.0.1:8080"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[frontend_origin, "http://localhost:3000", "http://127.0.0.1:3000", "https://anhntse183225.github.io", "https://musicbotui.pages.dev"],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -213,6 +219,22 @@ async def enforce_api_access(ctx, command_name: str):
         raise HTTPException(status_code=403, detail="Only administrators can use this command.")
 
 
+def format_song_for_api(song, guild):
+    if not song:
+        return None
+    song_copy = dict(song)
+    if not song_copy.get('requester_avatar') and song_copy.get('requester_id') and guild:
+        try:
+            member = guild.get_member(song_copy['requester_id'])
+            if member:
+                if hasattr(member, 'display_avatar') and member.display_avatar:
+                    song_copy['requester_avatar'] = str(member.display_avatar.url)
+                elif hasattr(member, 'avatar') and member.avatar:
+                    song_copy['requester_avatar'] = str(member.avatar.url)
+        except Exception:
+            pass
+    return song_copy
+
 @app.get("/api/queue/{guild_id}")
 async def get_queue(guild_id: str, user: dict = Depends(get_current_user)):
     guild = await verify_guild_access(guild_id, user)
@@ -221,8 +243,8 @@ async def get_queue(guild_id: str, user: dict = Depends(get_current_user)):
     if not state:
         return {"queue": [], "current": None, "volume": 100, "loop": False, "is_playing": False}
         
-    queue = state.get("queue", [])
-    current = state.get("current_song")
+    queue = [format_song_for_api(s, guild) for s in state.get("queue", [])]
+    current = format_song_for_api(state.get("current_song"), guild)
     
     # We need to return serializable objects. `current` might have datetime objects or other non-serializable fields,
     # but based on save_state_to_disk it's mostly a dict of strings/ints.
@@ -244,6 +266,7 @@ async def get_queue(guild_id: str, user: dict = Depends(get_current_user)):
     skip_v = bot_module.get_skip_votes_info(guild, 'skip') if hasattr(bot_module, 'get_skip_votes_info') else (0, 0, 0)
     pause_v = bot_module.get_skip_votes_info(guild, 'pause') if hasattr(bot_module, 'get_skip_votes_info') else (0, 0, 0)
     resume_v = bot_module.get_skip_votes_info(guild, 'resume') if hasattr(bot_module, 'get_skip_votes_info') else (0, 0, 0)
+    stop_v = bot_module.get_skip_votes_info(guild, 'stop') if hasattr(bot_module, 'get_skip_votes_info') else (0, 0, 0)
 
     return {
         "queue": queue,
@@ -260,7 +283,9 @@ async def get_queue(guild_id: str, user: dict = Depends(get_current_user)):
         "pause_votes": pause_v[0],
         "pause_votes_required": pause_v[1],
         "resume_votes": resume_v[0],
-        "resume_votes_required": resume_v[1]
+        "resume_votes_required": resume_v[1],
+        "stop_votes": stop_v[0],
+        "stop_votes_required": stop_v[1]
     }
 
 @app.get("/api/stream/{guild_id}")
@@ -280,8 +305,8 @@ async def stream_queue(guild_id: str, request: Request):
                 if not state:
                     data = {"queue": [], "current": None, "volume": 100, "loop": False, "is_playing": False, "bot_connected": False}
                 else:
-                    queue = state.get("queue", [])
-                    current = state.get("current_song")
+                    queue = [format_song_for_api(s, guild) for s in state.get("queue", [])]
+                    current = format_song_for_api(state.get("current_song"), guild)
                     
                     vc = guild.voice_client if hasattr(guild, 'voice_client') else None
                     bot_connected = vc is not None
@@ -299,6 +324,7 @@ async def stream_queue(guild_id: str, request: Request):
                     skip_v = bot_module.get_skip_votes_info(guild, 'skip') if hasattr(bot_module, 'get_skip_votes_info') else (0, 0, 0)
                     pause_v = bot_module.get_skip_votes_info(guild, 'pause') if hasattr(bot_module, 'get_skip_votes_info') else (0, 0, 0)
                     resume_v = bot_module.get_skip_votes_info(guild, 'resume') if hasattr(bot_module, 'get_skip_votes_info') else (0, 0, 0)
+                    stop_v = bot_module.get_skip_votes_info(guild, 'stop') if hasattr(bot_module, 'get_skip_votes_info') else (0, 0, 0)
 
                     data = {
                         "queue": queue,
@@ -315,7 +341,9 @@ async def stream_queue(guild_id: str, request: Request):
                         "pause_votes": pause_v[0],
                         "pause_votes_required": pause_v[1],
                         "resume_votes": resume_v[0],
-                        "resume_votes_required": resume_v[1]
+                        "resume_votes_required": resume_v[1],
+                        "stop_votes": stop_v[0],
+                        "stop_votes_required": stop_v[1]
                     }
                 yield f"data: {json.dumps(data)}\n\n"
                 await asyncio.sleep(1)
@@ -341,7 +369,7 @@ async def add_song(guild_id: str, req: AddSongRequest, user: dict = Depends(get_
     # Execute the yt command callback
     # We need to run it safely
     try:
-        await yt_command.callback(ctx, query=req.url)
+        asyncio.create_task(yt_command.callback(ctx, query=req.url))
         return {"status": "success"}
     except Exception as e:
         logger.error(f"Error adding song: {e}")
@@ -492,6 +520,7 @@ def start_api_server(host="0.0.0.0", port=8000):
     asyncio.create_task(_api_server.serve())
 
 def stop_api_server():
-    global _api_server
+    global _api_server, is_shutting_down
+    is_shutting_down = True
     if _api_server:
         _api_server.should_exit = True

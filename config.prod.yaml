@@ -26,7 +26,8 @@ playback:
 youtube:
   playlist_confirmation_timeout: 60
   max_playlist_items: 200
-  search_provider: "youtube_music"  # "youtube_music" (searches music.youtube.com) or "youtube" (searches youtube.com)
+  search_provider: "youtube_music"
+  detect_playlists: false
   # Regex patterns to blacklist (one per line, supports comments with #)
   blacklist_patterns:
     - "(?i)\\b9+\\s*[dđ](?:[oóòỏõọôồốổỗộơờớởỡợ])(?:[aáàảãạăằắẳẵặâầấẩẫậ])\\s*(?:h(?:[oóòỏõọôồốổỗộơờớởỡợ])(?:[aáàảãạăằắẳẵặâầấẩẫậ])\\s+)?h(?:[oóòỏõọôồốổỗộơờớởỡợ])ng\\b"
@@ -94,10 +95,6 @@ permissions:
 
     join:
       mode: "open"
-
-    play:
-      mode: "admin_only"
-
     yt:
       mode: "open"
 
@@ -129,13 +126,13 @@ permissions:
       mode: "vote_if_non_admin"
 
     skipto:
-      mode: "vote_if_non_admin"
+      mode: "admin_only"
 
     clear:
       mode: "admin_only"
 
     stop:
-      mode: "open"
+      mode: "vote_if_non_admin"
 
     pause:
       mode: "vote_if_non_admin"
@@ -172,4 +169,7 @@ api:
   host: "0.0.0.0"
   port: 8000
   frontend_url: "https://musicbotui.pages.dev"
+  cors_origins:
+    - "https://musicbotui.pages.dev"
+    - "https://anhntse183225.github.io"
   discord_redirect_uri: "https://theanh.tail38dac5.ts.net/callback"
