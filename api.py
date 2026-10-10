@@ -13,6 +13,7 @@ import httpx
 import sys
 bot_module = sys.modules.get('__main__')
 import settings
+import lyrics_service
 
 logger = logging.getLogger(__name__)
 
@@ -320,6 +321,26 @@ async def get_queue(guild_id: str, user: dict = Depends(get_current_user)):
         "stop_votes": stop_v[0],
         "stop_votes_required": stop_v[1]
     }
+
+@app.get("/api/lyrics/{guild_id}")
+async def get_lyrics(guild_id: str, user: dict = Depends(get_current_user)):
+    guild = await verify_guild_access(guild_id, user)
+    state = bot_module.get_music_state(guild)
+    if not state:
+        return {"lyrics": None, "error": "No active music session"}
+    
+    current_song = state.get("current_song")
+    if not current_song:
+        return {"lyrics": None, "error": "Nothing is currently playing"}
+    
+    lyrics_data = await asyncio.to_thread(
+        lyrics_service.get_lyrics_for_song,
+        current_song.get("title", ""),
+        current_song.get("artist", ""),
+        current_song.get("duration", 0),
+        current_song.get("data", "")
+    )
+    return {"lyrics": lyrics_data}
 
 @app.get("/api/stream/{guild_id}")
 async def stream_queue(guild_id: str, request: Request):
