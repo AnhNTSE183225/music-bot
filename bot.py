@@ -1603,7 +1603,7 @@ def get_skip_vote_required_count(ctx):
         base_required = max(1, int(threshold_value))
     else:
         ratio = float(threshold_value)
-        base_required = math.ceil(member_count * ratio)
+        base_required = math.floor(round(member_count * ratio, 9)) + 1
 
     required = max(min_votes, base_required)
     required = min(required, member_count)

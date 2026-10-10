@@ -398,7 +398,7 @@ def get_skip_vote_config():
     return {
         'threshold_type': vote_cfg.get('threshold_type', 'ratio'),
         'threshold_value': vote_cfg.get('threshold_value', 0.5),
-        'min_votes': vote_cfg.get('min_votes', 2),
+        'min_votes': vote_cfg.get('min_votes', 1),
         'same_channel_only': vote_cfg.get('same_channel_only', True),
         'force_vote_for_admin': vote_cfg.get('force_vote_for_admin', False),
     }
