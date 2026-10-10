@@ -126,10 +126,14 @@ def parse_youtube_url(query):
 
 
 def build_yt_music_search_url(query):
-    """Construct a YouTube Music search URL for a query string."""
+    """Construct a YouTube Music search URL for a query string.
+    
+    Appends '#songs' so yt-dlp triggers YouTube Music's 'Songs' filter tab,
+    prioritizing official album/studio tracks over music videos and skits.
+    """
     import urllib.parse
     cleaned = sanitize_query(query)
-    return f"https://music.youtube.com/search?q={urllib.parse.quote_plus(cleaned)}"
+    return f"https://music.youtube.com/search?q={urllib.parse.quote_plus(cleaned)}#songs"
 
 
 def format_duration(seconds):

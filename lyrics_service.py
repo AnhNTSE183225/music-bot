@@ -27,6 +27,10 @@ def clean_song_metadata(title: str, artist: str = ''):
     title = str(title or '').strip()
     artist = str(artist or '').strip()
 
+    # Split sub-titles / anthem tags separated by ' // '
+    if ' // ' in title:
+        title = title.split(' // ', 1)[0].strip()
+
     # Remove common video tags: [Official Video], (Audio), (MV), etc.
     cleaned = re.sub(r'\[.*?\]|\(.*?\)', '', title)
     cleaned = re.sub(
@@ -34,6 +38,8 @@ def clean_song_metadata(title: str, artist: str = ''):
         '',
         cleaned,
     )
+    # Remove featuring clauses (e.g. ft. / feat. / featuring)
+    cleaned = re.sub(r'(?i)\b(ft|feat|featuring)\b\.?.*', '', cleaned)
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
 
     # If title has "Artist - Track" or "Artist | Track"
