@@ -120,7 +120,7 @@ permissions:
       mode: "vote_if_non_admin"
       vote:
         threshold_type: "ratio"      # ratio or absolute
-        threshold_value: 0.5          # 50% when threshold_type is ratio
+        threshold_value: 0.5          # >50% when threshold_type is ratio
         min_votes: 1                  # floor for required votes
         same_channel_only: true
         force_vote_for_admin: false   # debug: when true, admins must vote like non-admins
