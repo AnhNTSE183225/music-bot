@@ -245,41 +245,103 @@ def fetch_betterlyrics(song: str, artist: str = '', duration: int = 0):
     return None
 
 
+def extract_primary_artist(artist: str) -> str:
+    """Extract first primary artist from multi-artist strings."""
+    if not artist:
+        return ''
+    a = artist.replace('，', ',').replace('／', '/').strip()
+    parts = re.split(r'[,;/]|\s+(?:x|&|feat\.?|ft\.?)\s+', a, flags=re.IGNORECASE)
+    return parts[0].strip() if parts else artist.strip()
+
+
+def normalize_title_for_comparison(title: str) -> str:
+    """Normalize title for fuzzy comparison without brackets or punctuation."""
+    if not title:
+        return ''
+    t = title.lower()
+    t = re.sub(r'\[.*?\]|\(.*?\)', '', t)
+    t = re.sub(r'[^\w\s]', ' ', t)
+    return re.sub(r'\s+', ' ', t).strip()
+
+
 def fetch_lrclib(song: str, artist: str = '', duration: int = 0):
     """Fetch synced LRC lyrics from LRCLIB API with exact query and fuzzy search fallback."""
     if not song:
         return None
 
-    # 1. Exact match
-    params = {'track_name': song}
-    if artist:
-        params['artist_name'] = artist
-    if duration and duration > 0:
-        params['duration'] = int(duration)
+    norm_target = normalize_title_for_comparison(song)
+    clean_artist = artist.replace('，', ',').strip()
+    primary_artist = extract_primary_artist(artist)
 
-    url = f"https://lrclib.net/api/get?{urllib.parse.urlencode(params)}"
-    try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'MusicBot/1.0'})
-        with urllib.request.urlopen(req, timeout=2.5) as resp:
-            data = json.loads(resp.read().decode('utf-8'))
-            if data.get('syncedLyrics'):
-                parsed = parse_lrc(data['syncedLyrics'])
-                if parsed and parsed.get('lines'):
-                    parsed['provider'] = 'lrclib'
-                    return parsed
-    except Exception:
-        pass
+    # 1. Exact match (try full artist, then primary artist)
+    artist_candidates = [clean_artist]
+    if primary_artist and primary_artist != clean_artist:
+        artist_candidates.append(primary_artist)
 
-    # 2. Search fallback
-    search_q = f"{artist} {song}".strip() if artist else song.strip()
+    for art in artist_candidates:
+        if not art:
+            continue
+        params = {'track_name': song, 'artist_name': art}
+        if duration and duration > 0:
+            params['duration'] = int(duration)
+
+        url = f"https://lrclib.net/api/get?{urllib.parse.urlencode(params)}"
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'MusicBot/1.0'})
+            with urllib.request.urlopen(req, timeout=2.5) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+                if data.get('syncedLyrics'):
+                    parsed = parse_lrc(data['syncedLyrics'])
+                    if parsed and parsed.get('lines'):
+                        parsed['provider'] = 'lrclib'
+                        return parsed
+        except Exception:
+            pass
+
+    # 2. Search fallback with smart candidate scoring (prevents sequels like '3107 3' taking over '3107')
+    search_q = f"{primary_artist or clean_artist} {song}".strip() if (primary_artist or clean_artist) else song.strip()
     search_url = f"https://lrclib.net/api/search?{urllib.parse.urlencode({'q': search_q})}"
     try:
         req = urllib.request.Request(search_url, headers={'User-Agent': 'MusicBot/1.0'})
         with urllib.request.urlopen(req, timeout=2.5) as resp:
             results = json.loads(resp.read().decode('utf-8'))
+            scored_candidates = []
             for item in results:
-                if item.get('syncedLyrics'):
-                    parsed = parse_lrc(item['syncedLyrics'])
+                if not item.get('syncedLyrics'):
+                    continue
+                cand_title = normalize_title_for_comparison(item.get('trackName', ''))
+                cand_dur = float(item.get('duration') or 0)
+                score = 0
+
+                if cand_title == norm_target:
+                    score += 100
+                elif norm_target in cand_title:
+                    extra = cand_title.replace(norm_target, '').strip()
+                    # Heavy penalty if candidate is a numbered sequel (e.g. searching '3107' but cand has '3107 3')
+                    if re.search(r'\b\d+\b', extra):
+                        score -= 70
+                    else:
+                        score += 20
+                else:
+                    score -= 50
+
+                # Duration match bonus
+                if duration and duration > 0 and cand_dur > 0:
+                    diff = abs(duration - cand_dur)
+                    if diff <= 4:
+                        score += 40
+                    elif diff <= 10:
+                        score += 15
+                    elif diff > 30:
+                        score -= 30
+
+                scored_candidates.append((score, item))
+
+            if scored_candidates:
+                scored_candidates.sort(key=lambda x: x[0], reverse=True)
+                top_score, top_item = scored_candidates[0]
+                if top_score > 0:
+                    parsed = parse_lrc(top_item['syncedLyrics'])
                     if parsed and parsed.get('lines'):
                         parsed['provider'] = 'lrclib'
                         return parsed
