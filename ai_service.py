@@ -27,21 +27,31 @@ logger = logging.getLogger(__name__)
 # Gemini configuration
 # ---------------------------------------------------------------------------
 
+from pathlib import Path
+
 try:
     from dotenv import load_dotenv
+    _env_file = Path(__file__).resolve().parent / ".env"
+    if _env_file.exists():
+        load_dotenv(dotenv_path=_env_file)
     load_dotenv()
 except ImportError:
     pass
+
+DEPRECATED_MODELS = {"gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.0-pro"}
 
 def get_gemini_api_key() -> str:
     """Return the currently configured Gemini API key."""
     return os.getenv("GEMINI_API_KEY", "").strip()
 
-GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
-GEMINI_ENDPOINT: str = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_MODEL}:generateContent"
-)
+def get_gemini_model() -> str:
+    """Return an active Gemini model name, automatically replacing deprecated models."""
+    configured = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+    if configured in DEPRECATED_MODELS or not configured:
+        return "gemini-3.8-flash"
+    return configured
+
+GEMINI_MODEL: str = get_gemini_model()
 
 _SYSTEM_PROMPT = """You are an expert music curator AI for a Discord music bot called MusicBỏTúi.
 The users may describe their desired vibe, mood, genre, or style in Vietnamese or English.
@@ -98,7 +108,7 @@ async def generate_search_queries(prompt: str, count: int = 8) -> list[str]:
         },
     }
 
-    model = os.getenv("GEMINI_MODEL", GEMINI_MODEL).strip()
+    model = get_gemini_model()
     endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     async with httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=15.0)) as client:
         resp = await client.post(
@@ -106,6 +116,28 @@ async def generate_search_queries(prompt: str, count: int = 8) -> list[str]:
             json=payload,
             headers={"Content-Type": "application/json"},
         )
+        if resp.status_code == 404 and model != "gemini-3.8-flash":
+            logger.warning("[AI] Model %r returned 404. Retrying with 'gemini-3.8-flash'...", model)
+            model = "gemini-3.8-flash"
+            endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            resp = await client.post(
+                f"{endpoint}?key={api_key}",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
+
+        if resp.status_code in (400, 403):
+            err_msg = ""
+            try:
+                err_msg = resp.json().get("error", {}).get("message", "")
+            except Exception:
+                pass
+            raise ValueError(f"Gemini API key error: {err_msg or 'Invalid key. Verify GEMINI_API_KEY in .env'}")
+        elif resp.status_code == 429:
+            raise ValueError("Gemini AI rate limit reached. Please wait a moment and try again.")
+        elif resp.status_code == 404:
+            raise ValueError(f"Gemini model '{model}' not found. Please use 'gemini-3.8-flash'.")
+
         resp.raise_for_status()
         data = resp.json()
 

@@ -37,11 +37,11 @@ if [ ! -f "$VENV_PYTHON" ]; then
     fi
 fi
 
-# Install/update dependencies on first run, on requirements change, or when yaml is missing
+# Install/update dependencies on first run, on requirements change, or when dependencies are missing
 VENV_MARKER="./venv/.installed"
 DEPS_HEALTHY=true
 
-$VENV_PYTHON -c "import yaml" >/dev/null 2>&1
+$VENV_PYTHON -c "import yaml, httpx, dotenv, fastapi, uvicorn" >/dev/null 2>&1
 if [ $? -ne 0 ]; then
     DEPS_HEALTHY=false
 fi
@@ -89,6 +89,29 @@ fi
 echo ""
 echo -e "\e[36mChecking for pip and yt-dlp updates...\e[0m"
 $VENV_PYTHON -m pip install -U pip yt-dlp
+
+# Load and validate .env file
+if [ -f ".env" ]; then
+    set -a
+    source .env 2>/dev/null || true
+    set +a
+else
+    echo -e "\e[33m[!] WARNING: .env file not found!\e[0m"
+    if [ -f ".env.example" ]; then
+        echo -e "\e[33m    Creating initial .env from .env.example...\e[0m"
+        cp .env.example .env
+        echo -e "\e[31m    ACTION REQUIRED: Edit .env to set your DISCORD_TOKEN and GEMINI_API_KEY.\e[0m"
+    fi
+fi
+
+# Verify GEMINI_API_KEY for AI features
+if [ -z "$GEMINI_API_KEY" ] || [[ "$GEMINI_API_KEY" == *"your_"* ]]; then
+    echo -e "\e[33m[!] NOTICE: GEMINI_API_KEY is not set in .env\e[0m"
+    echo -e "\e[33m    AI features will say 'AI unavailable' until a key is added.\e[0m"
+    echo -e "\e[33m    Get a free Gemini key at: https://aistudio.google.com\e[0m\n"
+else
+    echo -e "\e[32mOK: GEMINI_API_KEY configured.\e[0m\n"
+fi
 
 echo ""
 echo -e "\e[36mStarting bot...\e[0m"

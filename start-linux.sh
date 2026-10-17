@@ -54,7 +54,7 @@ VENV_PYTHON="./venv/bin/python"
 VENV_MARKER="./venv/.installed"
 DEPS_HEALTHY=true
 
-$VENV_PYTHON -c "import yaml" >/dev/null 2>&1
+$VENV_PYTHON -c "import yaml, httpx, dotenv, fastapi, uvicorn" >/dev/null 2>&1
 if [ $? -ne 0 ]; then
     DEPS_HEALTHY=false
 fi
@@ -93,6 +93,30 @@ echo -e "\e[36mChecking for pip and yt-dlp updates...\e[0m"
 $VENV_PYTHON -m pip install -U pip yt-dlp >/dev/null 2>&1
 
 echo -e "\e[36mConfiguring Environment...\e[0m"
+
+# Load and validate .env file
+if [ -f ".env" ]; then
+    set -a
+    source .env 2>/dev/null || true
+    set +a
+else
+    echo -e "\e[33m[!] WARNING: .env file not found!\e[0m"
+    if [ -f ".env.example" ]; then
+        echo -e "\e[33m    Creating initial .env from .env.example...\e[0m"
+        cp .env.example .env
+        echo -e "\e[31m    ACTION REQUIRED: Edit .env to set your DISCORD_TOKEN and GEMINI_API_KEY.\e[0m"
+    fi
+fi
+
+# Verify GEMINI_API_KEY for AI features
+if [ -z "$GEMINI_API_KEY" ] || [[ "$GEMINI_API_KEY" == *"your_"* ]]; then
+    echo -e "\e[33m[!] NOTICE: GEMINI_API_KEY is not set in .env\e[0m"
+    echo -e "\e[33m    AI features will say 'AI unavailable' until a key is added.\e[0m"
+    echo -e "\e[33m    Get a free Gemini key at: https://aistudio.google.com\e[0m\n"
+else
+    echo -e "\e[32mOK: GEMINI_API_KEY configured.\e[0m\n"
+fi
+
 RUNTIME_MODE="prod"
 MODE_CANDIDATE=$($VENV_PYTHON -c "import yaml, os; c=yaml.safe_load(open(os.getenv('MUSICBOT_CONFIG_FILE', 'config.yaml'),'r',encoding='utf-8')) or {}; print(str((c.get('runtime',{}) or {}).get('mode','prod')).strip().lower())" 2>/dev/null)
 if [ $? -eq 0 ] && [ -n "$MODE_CANDIDATE" ]; then
@@ -124,16 +148,30 @@ else
     echo -e "\e[32mRuntime mode: PROD\e[0m"
 fi
 
-# Starting Bot in Background
+# Starting Bot in Background (stops any existing instance first)
 if [ -f bot.pid ] && kill -0 $(cat bot.pid) 2>/dev/null; then
-    echo -e "\e[33mMusicBot is already running (PID $(cat bot.pid)).\e[0m"
-else
-    echo -e "\e[36mStarting bot in the background...\e[0m"
-    # We pipe /dev/null to stdin to cleanly disable console bridge
-    nohup $VENV_PYTHON ./bot.py < /dev/null > bot_runner.log 2>&1 &
-    echo $! > bot.pid
-    echo -e "\e[32mBot started (PID $(cat bot.pid))! Check bot_runner.log and logs/ for output.\e[0m"
+    OLD_PID=$(cat bot.pid)
+    echo -e "\e[33mStopping existing MusicBot process (PID $OLD_PID)...\e[0m"
+    kill $OLD_PID 2>/dev/null || true
+    sleep 2
+    if kill -0 $OLD_PID 2>/dev/null; then
+        kill -9 $OLD_PID 2>/dev/null || true
+    fi
+    echo -e "\e[32mOK: Previous process stopped.\e[0m"
 fi
+
+echo -e "\e[36mStarting bot in the background...\e[0m"
+# We pipe /dev/null to stdin to cleanly disable console bridge
+nohup $VENV_PYTHON ./bot.py < /dev/null > bot_runner.log 2>&1 &
+BOT_PID=$!
+echo $BOT_PID > bot.pid
+sleep 2
+if ! kill -0 $BOT_PID 2>/dev/null; then
+    echo -e "\e[31mERROR: Bot failed to start! Last lines of bot_runner.log:\e[0m"
+    tail -n 25 bot_runner.log
+    exit 1
+fi
+echo -e "\e[32mBot started (PID $BOT_PID)! Check bot_runner.log and logs/ for output.\e[0m"
 
 # Starting Tailscale Funnel in Background
 if [ -f tailscale_funnel.pid ] && kill -0 $(cat tailscale_funnel.pid) 2>/dev/null; then

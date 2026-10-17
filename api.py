@@ -499,8 +499,8 @@ async def ai_suggest(
     except ValueError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     except Exception as exc:
-        logger.error("[AI] Gemini error: %s", exc)
-        raise HTTPException(status_code=502, detail="AI service unavailable")
+        logger.error("[AI] Gemini error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=502, detail=f"AI service error: {exc}")
 
     songs = await ai_service.search_songs(
         queries,
