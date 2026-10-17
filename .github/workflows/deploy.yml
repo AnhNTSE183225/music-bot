@@ -54,8 +54,8 @@ jobs:
           # 3. Create cleaned .env file for the application on runner
           echo "$ENV_SECRET" | tr -d '\r' | grep -v -E '^SSH_(HOST|USER|PASSWORD|PORT)=' > app.env
 
-          # 4. Copy app.env to the server
-          SSHPASS="$SSH_PASSWORD" sshpass -e scp -o StrictHostKeyChecking=no -o ConnectTimeout=15 -P "$SSH_PORT" app.env "$SSH_USER@$SSH_HOST:~/workspace/music-bot/.env.new"
+          # 4. Copy app.env to the server (placed in /tmp so git clean -df does not remove it)
+          SSHPASS="$SSH_PASSWORD" sshpass -e scp -o StrictHostKeyChecking=no -o ConnectTimeout=15 -P "$SSH_PORT" app.env "$SSH_USER@$SSH_HOST:/tmp/musicbot.env.new"
 
           # 5. Execute deployment commands remotely over SSH
           SSHPASS="$SSH_PASSWORD" sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "
@@ -71,7 +71,7 @@ jobs:
             echo '2. Wiping old .env and activating fresh configuration...'
             [ -f .env ] && cp -f .env .env.bak || true
             rm -f .env
-            mv -f .env.new .env
+            mv -f /tmp/musicbot.env.new .env
 
             echo '3. Stopping old services...'
             ./stop-linux.sh || true
