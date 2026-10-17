@@ -1713,6 +1713,13 @@ async def play_next(ctx):
     queue_wait_ms = int((time.perf_counter() - song.get('enqueued_perf', time.perf_counter())) * 1000)
 
     try:
+        import api
+        if hasattr(api, 'check_and_trigger_autoqueue') and getattr(ctx, 'guild', None):
+            asyncio.create_task(api.check_and_trigger_autoqueue(ctx.guild))
+    except Exception:
+        pass
+
+    try:
         logger.debug(f"Now playing - {song['type']}: {song['title']}")
         # 1. Create the base Source
         if song['type'] == 'youtube':

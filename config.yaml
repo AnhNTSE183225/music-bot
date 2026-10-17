@@ -166,6 +166,15 @@ permissions:
     normalize:
       mode: "admin_only"
 
+    ai_autoqueue:
+      mode: "vote_if_non_admin"
+      vote:
+        threshold_type: "ratio"
+        threshold_value: 0.5
+        min_votes: 1
+        same_channel_only: true
+        force_vote_for_admin: false
+
 # API & Web UI Settings
 api:
   host: "0.0.0.0"
