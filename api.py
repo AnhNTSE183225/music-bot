@@ -251,6 +251,15 @@ async def enforce_api_access(ctx, command_name: str):
     mode = bot_module.get_command_mode(command_name)
     if mode == 'admin_only' and not bot_module.is_admin_member(ctx.author):
         raise HTTPException(status_code=403, detail="Only administrators can use this command.")
+    if (
+        command_name == 'ai_autoqueue'
+        and mode == 'vote_if_non_admin'
+        and not bot_module.is_admin_member(ctx.author)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Only administrators can configure AI Auto-Queue via API.",
+        )
 
 
 def format_song_for_api(song, guild):
@@ -756,9 +765,10 @@ async def change_volume(guild_id: str, req: VolumeRequest, user: dict = Depends(
 
 _api_server = None
 _api_task = None
+_ai_autoqueue_task = None
 
 def start_api_server(host="0.0.0.0", port=8000):
-    global _api_server, _api_task, is_shutting_down
+    global _api_server, _api_task, _ai_autoqueue_task, is_shutting_down
     if _api_task and not _api_task.done():
         logger.info("API server is already running.")
         return
@@ -777,19 +787,29 @@ def start_api_server(host="0.0.0.0", port=8000):
     _api_server = uvicorn.Server(config)
     _api_task = asyncio.create_task(_api_server.serve())
     # Start the AI Auto-Queue background daemon alongside the API server
-    asyncio.create_task(_ai_autoqueue_daemon())
+    if not _ai_autoqueue_task or _ai_autoqueue_task.done():
+        _ai_autoqueue_task = asyncio.create_task(_ai_autoqueue_daemon())
 
 def stop_api_server():
-    global _api_server, is_shutting_down
+    global _api_server, _ai_autoqueue_task, is_shutting_down
     is_shutting_down = True
     if _api_server:
         _api_server.should_exit = True
+    if _ai_autoqueue_task and not _ai_autoqueue_task.done():
+        _ai_autoqueue_task.cancel()
 
 async def wait_api_server_shutdown(timeout=2.0):
-    global _api_task, _api_server, is_shutting_down
+    global _api_task, _api_server, _ai_autoqueue_task, is_shutting_down
     is_shutting_down = True
     if _api_server:
         _api_server.should_exit = True
+    if _ai_autoqueue_task and not _ai_autoqueue_task.done():
+        _ai_autoqueue_task.cancel()
+        try:
+            await asyncio.wait_for(_ai_autoqueue_task, timeout=1.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+            pass
+    _ai_autoqueue_task = None
     if _api_task and not _api_task.done():
         try:
             await asyncio.wait_for(_api_task, timeout=timeout)
@@ -799,4 +819,3 @@ async def wait_api_server_shutdown(timeout=2.0):
                 await asyncio.wait_for(_api_task, timeout=1.0)
             except Exception:
                 pass
-
