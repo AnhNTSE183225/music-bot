@@ -507,9 +507,9 @@ async def ai_suggest(
         max_per_query=2,
         blacklist_patterns=list(settings.YT_BLACKLIST_PATTERNS or []),
         recent_titles=recent,
+        prompt=req.prompt,
     )
-    # Return a few extra so the user can choose which to remove before adding
-    return {"songs": songs[: req.count + 3], "prompt": req.prompt}
+    return {"songs": songs[: max(1, req.count)], "prompt": req.prompt}
 
 
 @app.post("/api/ai/{guild_id}/confirm")
@@ -713,6 +713,7 @@ async def _daemon_fill_queue(guild, prompt: str, count: int, state: dict) -> Non
             max_per_query=2,
             blacklist_patterns=list(settings.YT_BLACKLIST_PATTERNS or []),
             recent_titles=recent,
+            prompt=prompt,
         )
     except Exception as exc:
         logger.error("[AI AutoQueue] Failed to fetch suggestions: %s", exc)
