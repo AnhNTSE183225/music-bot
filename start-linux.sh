@@ -205,9 +205,9 @@ if [ -f tailscale_funnel.pid ] && kill -0 $(cat tailscale_funnel.pid) 2>/dev/nul
     echo -e "\e[33mTailscale Funnel is already running (PID $(cat tailscale_funnel.pid)).\e[0m"
 else
     echo -e "\e[36mStarting Tailscale Funnel on port 8000...\e[0m"
-    # Refresh sudo credentials in the foreground so the background process doesn't get stuck asking for a password
-    sudo -v
-    sudo tailscale funnel 8000 > "$LOGS_DIR/tailscale_funnel.log" 2>&1 &
+    # Refresh sudo credentials if available without blocking CI
+    sudo -n -v 2>/dev/null || true
+    (sudo -n tailscale funnel 8000 2>/dev/null || tailscale funnel 8000) > "$LOGS_DIR/tailscale_funnel.log" 2>&1 &
     echo $! > tailscale_funnel.pid
     echo -e "\e[32mTailscale funnel started! Logs are in $LOGS_DIR/tailscale_funnel.log\e[0m"
 fi

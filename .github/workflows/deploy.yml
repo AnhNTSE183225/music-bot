@@ -58,8 +58,8 @@ jobs:
           SSHPASS="$SSH_PASSWORD" sshpass -e scp -o StrictHostKeyChecking=no -o ConnectTimeout=15 -P "$SSH_PORT" app.env "$SSH_USER@$SSH_HOST:/tmp/musicbot.env.new"
 
           # 5. Execute deployment commands remotely over SSH
-          SSHPASS="$SSH_PASSWORD" sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "
-            set -e
+          SSHPASS="$SSH_PASSWORD" sshpass -e ssh -tt -o StrictHostKeyChecking=no -o ConnectTimeout=15 -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "
+            set -ex
             echo '=== Starting Automated Deployment on Server ==='
             cd ~/workspace/music-bot || { echo 'Directory ~/workspace/music-bot not found!'; exit 1; }
 
@@ -75,7 +75,6 @@ jobs:
 
             echo '3. Stopping old services...'
             ./stop-linux.sh || true
-            pkill -f 'python.*bot.py' || true
 
             echo '4. Starting services...'
             ./start-linux.sh
