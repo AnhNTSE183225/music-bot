@@ -65,6 +65,13 @@ SESSIONS = {}
 
 class AddSongRequest(BaseModel):
     url: str
+    title: str | None = None
+    artist: str | None = None
+    thumbnail: str | None = None
+    duration: float | None = None
+
+class AIBatchConfirmRequest(BaseModel):
+    songs: list[AddSongRequest]
 
 class VolumeRequest(BaseModel):
     volume: int
@@ -511,8 +518,74 @@ async def ai_confirm(
     req: AddSongRequest,
     user: dict = Depends(get_current_user),
 ):
-    """Add a single AI-suggested song URL to the queue. Delegates to the existing add_song logic."""
+    """Add a single AI-suggested song to the queue with metadata."""
+    guild = await verify_guild_access(guild_id, user)
+    ctx = get_simulated_context(guild, user)
+    await enforce_api_access(ctx, 'yt')
+
+    if not await bot_module.ensure_voice_connected(ctx):
+        raise HTTPException(status_code=400, detail="Bot is not connected to a voice channel.")
+
+    if req.title:
+        video_data = {
+            'title': req.title,
+            'webpage_url': req.url,
+            'artist': req.artist,
+            'thumbnail': req.thumbnail,
+            'duration': req.duration or 0,
+        }
+        song_obj = await bot_module.enqueue_single_song_from_url(
+            ctx,
+            title=req.title,
+            webpage_url=req.url,
+            video_data=video_data,
+        )
+        if not song_obj:
+            raise HTTPException(status_code=400, detail="Could not enqueue song (may be blacklisted)")
+        return {"status": "success", "title": req.title}
+
     return await add_song(guild_id, req, user)
+
+
+@app.post("/api/ai/{guild_id}/confirm_batch")
+async def ai_confirm_batch(
+    guild_id: str,
+    req: AIBatchConfirmRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Add a list of AI-suggested songs to the queue in order without dropping tracks."""
+    guild = await verify_guild_access(guild_id, user)
+    ctx = get_simulated_context(guild, user)
+    await enforce_api_access(ctx, 'yt')
+
+    if not await bot_module.ensure_voice_connected(ctx):
+        raise HTTPException(status_code=400, detail="Bot is not connected to a voice channel.")
+
+    added = 0
+    for s in req.songs:
+        if not s.url:
+            continue
+        try:
+            video_data = {
+                'title': s.title or "YouTube Track",
+                'webpage_url': s.url,
+                'artist': s.artist,
+                'thumbnail': s.thumbnail,
+                'duration': s.duration or 0,
+            }
+            song_obj = await bot_module.enqueue_single_song_from_url(
+                ctx,
+                title=s.title or "YouTube Track",
+                webpage_url=s.url,
+                video_data=video_data,
+            )
+            if song_obj:
+                added += 1
+        except Exception as exc:
+            logger.warning("[AI] Failed to add %r in batch: %s", s.url, exc)
+
+    logger.info("[AI] Batch added %d/%d songs for guild %s", added, len(req.songs), guild_id)
+    return {"status": "success", "added_count": added}
 
 
 @app.post("/api/ai/{guild_id}/autoqueue")
@@ -548,15 +621,63 @@ async def get_autoqueue(
 
 
 # ---------------------------------------------------------------------------
-# AI Auto-Queue background daemon
+# AI Auto-Queue background daemon and trigger logic
 # ---------------------------------------------------------------------------
+
+_autoqueue_filling: set[str] = set()
+
+async def check_and_trigger_autoqueue(guild) -> bool:
+    """Check remaining queue length for guild and auto-fill if below threshold.
+
+    Songs left is calculated as: len(queue) - 1 - queue_index
+    (e.g., 5 songs total with song at index 2 currently playing = 2 songs left).
+    """
+    if not guild or not bot_instance:
+        return False
+
+    guild_id = str(guild.id)
+    if guild_id in _autoqueue_filling:
+        return False
+
+    cfg = _ai_autoqueue_state.get(guild_id)
+    if not cfg or not cfg.get("enabled") or not cfg.get("prompt"):
+        return False
+
+    state = bot_module.get_music_state(guild) or {}
+    queue = state.get("queue", [])
+    current_idx = state.get("queue_index", -1)
+
+    if current_idx >= 0 and current_idx < len(queue):
+        songs_left = max(0, len(queue) - 1 - current_idx)
+    else:
+        songs_left = len(queue)
+
+    threshold = int(cfg.get("threshold", 2))
+    count = int(cfg.get("count", 5))
+    prompt = cfg["prompt"]
+
+    if songs_left < threshold:
+        logger.info(
+            "[AI AutoQueue] Guild %s: songs_left=%d < threshold=%d — auto-filling %d songs with prompt %r",
+            guild_id, songs_left, threshold, count, prompt,
+        )
+        _autoqueue_filling.add(guild_id)
+        try:
+            await _daemon_fill_queue(guild, prompt, count, state)
+            return True
+        except Exception as exc:
+            logger.error("[AI AutoQueue] Fill failed for guild %s: %s", guild_id, exc, exc_info=True)
+            return False
+        finally:
+            _autoqueue_filling.discard(guild_id)
+
+    return False
+
 
 async def _ai_autoqueue_daemon() -> None:
     """Background coroutine that monitors all guilds with AI Auto-Queue enabled.
 
-    Every 30 seconds it checks each configured guild's queue length. When the
-    queue falls below the configured threshold, it generates new suggestions
-    using the stored prompt and silently adds them to the queue.
+    Every 30 seconds it checks each configured guild and tops up if songs left < threshold.
     """
     logger.info("[AI AutoQueue] Daemon started.")
     while not is_shutting_down:
@@ -569,19 +690,7 @@ async def _ai_autoqueue_daemon() -> None:
                 guild = bot_instance.get_guild(int(guild_id))
                 if not guild:
                     continue
-
-                state = bot_module.get_music_state(guild) or {}
-                queue_len = len(state.get("queue", []))
-                threshold = int(cfg.get("threshold", 2))
-                count = int(cfg.get("count", 5))
-                prompt = cfg["prompt"]
-
-                if queue_len < threshold:
-                    logger.info(
-                        "[AI AutoQueue] Guild %s: queue=%d < threshold=%d — auto-filling %d songs",
-                        guild_id, queue_len, threshold, count,
-                    )
-                    await _daemon_fill_queue(guild, prompt, count, state)
+                await check_and_trigger_autoqueue(guild)
         except Exception as exc:
             logger.error("[AI AutoQueue] Daemon error: %s", exc, exc_info=True)
 
@@ -610,21 +719,32 @@ async def _daemon_fill_queue(guild, prompt: str, count: int, state: dict) -> Non
         return
 
     added = 0
+    # Build a headless (console) context the same way api.py does for non-user calls
+    console_author = bot_module.create_console_author()
+    console_author.display_name = "AI Auto-Queue"
+    console_author.name = "AI Auto-Queue"
+    text_channel = guild.get_channel(state.get("text_channel_id")) if state else None
+    ctx = bot_module.MusicContext(bot=bot_instance, guild=guild, channel=text_channel, author=console_author)
+
     for song in songs[:count]:
         url = song.get("url")
         if not url:
             continue
         try:
-            # Build a headless (console) context the same way api.py does for non-user calls
-            console_author = bot_module.create_console_author()
-            console_author.display_name = "AI Auto-Queue"
-            console_author.name = "AI Auto-Queue"
-            state = bot_module.get_music_state(guild) or {}
-            text_channel = guild.get_channel(state.get("text_channel_id")) if state else None
-            ctx = bot_module.MusicContext(bot=bot_instance, guild=guild, channel=text_channel, author=console_author)
-            yt_command = bot_instance.get_command('yt')
-            if yt_command:
-                asyncio.create_task(yt_command.callback(ctx, query=url))
+            video_data = {
+                'title': song.get('title') or "YouTube Track",
+                'webpage_url': url,
+                'artist': song.get('artist'),
+                'thumbnail': song.get('thumbnail'),
+                'duration': song.get('duration', 0),
+            }
+            song_obj = await bot_module.enqueue_single_song_from_url(
+                ctx,
+                title=song.get('title') or "YouTube Track",
+                webpage_url=url,
+                video_data=video_data,
+            )
+            if song_obj:
                 added += 1
         except Exception as exc:
             logger.warning("[AI AutoQueue] Could not add %r: %s", url, exc)
