@@ -73,9 +73,6 @@ ytdl_options:
   default_search: "auto"
   source_address: "0.0.0.0"
   geo_bypass: true
-  extractor_args:
-    youtube:
-      - "player_client=android,ios"
 
 # FFmpeg Stream Options
 ffmpeg:
@@ -185,3 +182,24 @@ api:
     - "https://musicbotui.pages.dev"
     - "https://anhntse183225.github.io"
   discord_redirect_uri: "https://theanh.tail38dac5.ts.net/callback"
+
+# AI Service Settings
+ai:
+  model: "gemini-3.5-flash-lite"
+  candidate_multiplier: 2      # Fetches count * 2 queries for candidate resilience
+  temperature: 0.85
+  max_output_tokens: 2048
+  cooldown_hours: 6            # Fallback cooldown in hours if Gemini does not provide retryDelay
+  min_view_count: 1000         # Filter out low-view/spam tracks
+  score_penalties:
+    live: 0.1
+    lyrics: 0.15
+    vietsub: 0.15
+    karaoke: 0.05
+    remix: 0.2
+    acoustic: 0.25
+    cover: 0.1
+    speed_up: 0.05
+    slowed: 0.05
+    instrumental: 0.1
+

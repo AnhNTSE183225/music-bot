@@ -188,13 +188,9 @@ def get_ytdl_options():
                     else:
                         formatted_extractor_args[extractor][k] = [v]
 
-    # Ensure youtube player_client defaults to mobile clients (android, ios) to bypass web bot checks
-    if 'youtube' not in formatted_extractor_args:
-        formatted_extractor_args['youtube'] = {}
-    if 'player_client' not in formatted_extractor_args['youtube']:
-        formatted_extractor_args['youtube']['player_client'] = ['android', 'ios']
+    if formatted_extractor_args:
+        options['extractor_args'] = formatted_extractor_args
 
-    options['extractor_args'] = formatted_extractor_args
     options['js_runtimes'] = {'node': {}}
 
     return options
@@ -411,8 +407,21 @@ API_HOST = os.getenv('MUSICBOT_API_HOST', _config.get('api', {}).get('host', '0.
 API_PORT = int(os.getenv('MUSICBOT_API_PORT', _config.get('api', {}).get('port', 8000)))
 FRONTEND_URL = os.getenv('MUSICBOT_FRONTEND_URL', _config.get('api', {}).get('frontend_url', 'http://localhost:3000'))
 DISCORD_REDIRECT_URI = os.getenv('MUSICBOT_DISCORD_REDIRECT_URI', _config.get('api', {}).get('discord_redirect_uri', 'http://localhost:8000/callback'))
-DISCORD_CLIENT_ID = os.getenv('DISCORD_CLIENT_ID', _config.get('api', {}).get('client_id'))
-DISCORD_CLIENT_SECRET = os.getenv('DISCORD_CLIENT_SECRET', _config.get('api', {}).get('client_secret'))
+DISCORD_CLIENT_ID = os.getenv('DEV_DISCORD_CLIENT_ID') or os.getenv('DISCORD_CLIENT_ID', _config.get('api', {}).get('client_id'))
+DISCORD_CLIENT_SECRET = os.getenv('DEV_DISCORD_CLIENT_SECRET') or os.getenv('DISCORD_CLIENT_SECRET', _config.get('api', {}).get('client_secret'))
 CORS_ORIGINS = _config.get('api', {}).get('cors_origins', [])
 EMPTY_VOICE_LEAVE_DELAY_SECONDS = int(os.getenv('MUSICBOT_EMPTY_VOICE_LEAVE_DELAY_SECONDS', _config.get('playback', {}).get('empty_voice_leave_delay_seconds', 10)))
+
+# --- AI Service Configuration ---
+def get_ai_config() -> dict:
+    """Return dictionary of AI configuration parameters from config file."""
+    return _config.get('ai', {}) or {}
+
+AI_MODEL = os.getenv('GEMINI_MODEL', get_ai_config().get('model', 'gemini-3.5-flash-lite'))
+AI_CANDIDATE_MULTIPLIER = int(get_ai_config().get('candidate_multiplier', 2))
+AI_TEMPERATURE = float(get_ai_config().get('temperature', 0.85))
+AI_MAX_OUTPUT_TOKENS = int(get_ai_config().get('max_output_tokens', 2048))
+AI_COOLDOWN_HOURS = float(get_ai_config().get('cooldown_hours', 6.0))
+AI_MIN_VIEW_COUNT = int(get_ai_config().get('min_view_count', 1000))
+AI_SCORE_PENALTIES = get_ai_config().get('score_penalties', {}) or {}
 

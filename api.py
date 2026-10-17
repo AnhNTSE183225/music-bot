@@ -6,7 +6,7 @@ import urllib.parse
 
 from fastapi import FastAPI, Request, Response, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse, PlainTextResponse, FileResponse
 import json
 from pydantic import BaseModel
 import httpx
@@ -15,6 +15,10 @@ bot_module = sys.modules.get('__main__')
 import settings
 import lyrics_service
 import ai_service
+import db
+
+# Initialize database schema
+db.init_db()
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +38,10 @@ def set_bot(bot):
     global bot_instance
     bot_instance = bot
 
-DISCORD_CLIENT_ID = getattr(settings, "DISCORD_CLIENT_ID", None) or os.getenv("DISCORD_CLIENT_ID")
-DISCORD_CLIENT_SECRET = getattr(settings, "DISCORD_CLIENT_SECRET", None) or os.getenv("DISCORD_CLIENT_SECRET")
-DISCORD_REDIRECT_URI = getattr(settings, "DISCORD_REDIRECT_URI", "http://localhost:8000/callback")
-FRONTEND_URL = getattr(settings, "FRONTEND_URL", "http://localhost:3000")
+DISCORD_CLIENT_ID = (getattr(settings, "DISCORD_CLIENT_ID", None) or os.getenv("DEV_DISCORD_CLIENT_ID") or os.getenv("DISCORD_CLIENT_ID", "")).strip()
+DISCORD_CLIENT_SECRET = (getattr(settings, "DISCORD_CLIENT_SECRET", None) or os.getenv("DEV_DISCORD_CLIENT_SECRET") or os.getenv("DISCORD_CLIENT_SECRET", "")).strip()
+DISCORD_REDIRECT_URI = (getattr(settings, "DISCORD_REDIRECT_URI", "http://localhost:8000/callback")).strip()
+FRONTEND_URL = (getattr(settings, "FRONTEND_URL", "http://localhost:3000")).strip()
 
 frontend_origin = ""
 if FRONTEND_URL:
@@ -61,8 +65,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-SESSIONS = {}
-
 class AddSongRequest(BaseModel):
     url: str
     title: str | None = None
@@ -79,6 +81,9 @@ class VolumeRequest(BaseModel):
 class IndexRequest(BaseModel):
     index: int
 
+class ContributeKeyRequest(BaseModel):
+    api_key: str
+
 # ---------------------------------------------------------------------------
 # AI Auto-Queue — models and in-memory state
 # ---------------------------------------------------------------------------
@@ -93,9 +98,34 @@ class AIAutoQueueConfig(BaseModel):
     prompt: str
     count: int = 5
     threshold: int = 2
+    set_by_name: str | None = None
+    set_by_avatar: str | None = None
 
-# guild_id -> {enabled, prompt, count, threshold}
-_ai_autoqueue_state: dict[str, dict] = {}
+# guild_id -> {enabled, prompt, count, threshold, set_by_name, set_by_avatar}
+# Load saved configurations from SQLite; all initialized as enabled=False
+try:
+    _ai_autoqueue_state: dict[str, dict] = db.load_all_autoqueue_configs()
+except Exception as _load_exc:
+    logger.warning("[AI AutoQueue] Could not load persisted configs from SQLite: %s", _load_exc)
+    _ai_autoqueue_state = {}
+
+
+def disable_autoqueue(guild_id: str | int | None) -> None:
+    """Disable auto-queue toggle for a specific guild (e.g. when leaving voice or guild), keeping the vibe config intact."""
+    if guild_id is None:
+        return
+    gid = str(guild_id)
+    if gid in _ai_autoqueue_state:
+        if _ai_autoqueue_state[gid].get("enabled"):
+            _ai_autoqueue_state[gid]["enabled"] = False
+            logger.info("[AI AutoQueue] Disabled auto-queue toggle for guild %s (voice left or disconnected). Config vibe preserved.", gid)
+
+
+def reset_all_autoqueue() -> None:
+    """Ensure auto-queue toggle is disabled across all guilds on bot startup, keeping config vibe in memory/DB."""
+    for gid in list(_ai_autoqueue_state.keys()):
+        _ai_autoqueue_state[gid]["enabled"] = False
+    logger.info("[AI AutoQueue] All autoqueue toggles disabled on startup (all vibes preserved in SQLite).")
 
 @app.get("/login")
 def login():
@@ -144,11 +174,8 @@ async def callback(code: str, response: Response):
         guilds_data = guilds_res.json()
         
         session_id = str(uuid4())
-        SESSIONS[session_id] = {
-            "user": user_data,
-            "guilds": guilds_data,
-            "access_token": access_token
-        }
+        # Persist session to SQLite (survives backend restarts for 30 days)
+        db.save_session(session_id, user_data, guilds_data, access_token)
         
         separator = "&" if "?" in FRONTEND_URL else "?"
         res = RedirectResponse(url=f"{FRONTEND_URL}{separator}token={session_id}")
@@ -158,24 +185,158 @@ from fastapi.security import OAuth2PasswordBearer
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token", auto_error=False)
 
 async def get_current_user(token: str = Depends(oauth2_scheme)):
-    if not token or token not in SESSIONS:
+    if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    return SESSIONS[token]
+    session = db.get_session(token)
+    if not session:
+        raise HTTPException(status_code=401, detail="Session expired or not found")
+    return session
+
+@app.post("/api/logout")
+async def logout(token: str = Depends(oauth2_scheme)):
+    if token:
+        db.delete_session(token)
+    return {"status": "success"}
+
+# ---------------------------------------------------------------------------
+# Gemini Key Management & Community Contribution Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/ai/keys")
+async def list_gemini_keys(user: dict = Depends(get_current_user)):
+    """List all contributed Gemini keys with masked strings and live health/cooldown statuses."""
+    keys = db.get_all_gemini_keys_for_display()
+    is_admin = False
+    author = get_simulated_context(None, user).author if bot_instance else None
+    if author:
+        is_admin = bot_module.is_admin_member(author)
+
+    return {
+        "keys": keys,
+        "total_active": sum(1 for k in keys if k["is_active"] and k["status"] == "healthy"),
+        "total_keys": len(keys),
+        "is_admin": is_admin,
+    }
+
+@app.post("/api/ai/keys/contribute")
+async def contribute_gemini_key(req: ContributeKeyRequest, user: dict = Depends(get_current_user)):
+    """Add a user-contributed Gemini API key to the rotation pool.
+
+    Validates key health with Google Gemini:
+    - Active/Healthy keys (HTTP 200) join rotation immediately.
+    - Exhausted keys (HTTP 429) are saved and placed on cooldown until quota resets.
+    - Expired/Rejected keys (HTTP 400/403) are kept in the pool as inactive.
+    """
+    key = req.api_key.strip().strip('"').strip("'")
+    if not key:
+        raise HTTPException(status_code=400, detail="API key is required.")
+
+    # 1. Probe key directly against Google Gemini
+    probe = await ai_service.verify_gemini_api_key(key)
+    probe_status = probe.get("status")
+    probe_msg = probe.get("message", "")
+    retry_delay = probe.get("retry_delay", 0.0)
+
+    if probe_status == "error":
+        # Network connection to Google timed out or failed during probe; save key as active with warning
+        logger.warning(f"[AI Key] Probe could not reach Google ({probe_msg}). Saving as active without live verification.")
+        probe_status = "healthy"
+        probe_msg = "Added without live probe (Google connection timed out during verification)."
+
+    user_info = user.get("user", {})
+    user_id = str(user_info.get("id", "anonymous"))
+    username = str(user_info.get("username", "Community Contributor"))
+    avatar = user_info.get("avatar")
+
+    if probe_status == "healthy":
+        res = db.add_gemini_key(
+            key, user_id=user_id, username=username, avatar=avatar,
+            initial_status="healthy", status_message="", cooldown_seconds=0.0, is_active=True
+        )
+        msg = "Key verified and active in the pool!"
+    elif probe_status == "quota_exceeded":
+        res = db.add_gemini_key(
+            key, user_id=user_id, username=username, avatar=avatar,
+            initial_status="quota_exceeded", status_message=probe_msg, cooldown_seconds=retry_delay, is_active=True
+        )
+        minutes = max(1, int(retry_delay // 60))
+        msg = f"Key added! It is currently exhausted (cooling down for ~{minutes}m) and will automatically activate once quota resets."
+    else:  # invalid / expired
+        res = db.add_gemini_key(
+            key, user_id=user_id, username=username, avatar=avatar,
+            initial_status="invalid", status_message=probe_msg, cooldown_seconds=0.0, is_active=False
+        )
+        msg = f"Key saved to pool as inactive/expired ({probe_msg}). You can keep it here and reactivate it later."
+
+    return {
+        "status": "success",
+        "key_status": probe_status,
+        "message": msg,
+        "key_info": res,
+    }
+
+@app.delete("/api/ai/keys/{key_id}")
+async def remove_gemini_key(key_id: int, user: dict = Depends(get_current_user)):
+    """Delete a key from the pool (Admin only)."""
+    author = get_simulated_context(None, user).author if bot_instance else None
+    if not author or not bot_module.is_admin_member(author):
+        raise HTTPException(status_code=403, detail="Only administrators can delete keys.")
+
+    deleted = db.delete_gemini_key(key_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Key not found.")
+    return {"status": "success"}
+
 
 @app.get("/api/me")
 async def get_me(user: dict = Depends(get_current_user)):
     return {"user": user["user"]}
+
+
+@app.get("/api/logs", response_class=PlainTextResponse)
+async def get_recent_logs(lines: int = 200, user: dict = Depends(get_current_user)):
+    """Return the last N lines of the current log file for debugging."""
+    log_file = getattr(settings, 'LOG_FILE', 'logs/musicbot-prod.log')
+    if not os.path.exists(log_file):
+        for candidate in ["logs/musicbot-prod.log", "logs/start.log", "logs/start-linux.log", "logs/bot_runner.log"]:
+            if os.path.exists(candidate):
+                log_file = candidate
+                break
+    if not os.path.exists(log_file):
+        return "No log file found."
+    try:
+        with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+            all_lines = f.readlines()
+            tail_lines = all_lines[-max(1, min(lines, 2000)):]
+            return "".join(tail_lines)
+    except Exception as e:
+        return f"Error reading log file {log_file}: {e}"
+
+
+@app.get("/api/logs/download")
+async def download_current_log(file_name: str = "app", user: dict = Depends(get_current_user)):
+    """Download log files (app, runner, or start) as an attachment."""
+    log_dir = "logs"
+    candidates = {
+        "app": getattr(settings, 'LOG_FILE', os.path.join(log_dir, "musicbot-prod.log")),
+        "runner": os.path.join(log_dir, "bot_runner.log"),
+        "start": os.path.join(log_dir, "start-linux.log") if os.path.exists(os.path.join(log_dir, "start-linux.log")) else os.path.join(log_dir, "start.log")
+    }
+    target = candidates.get(file_name, candidates["app"])
+    if not os.path.exists(target):
+        raise HTTPException(status_code=404, detail=f"Log file '{file_name}' not found.")
+    return FileResponse(target, media_type="text/plain", filename=os.path.basename(target))
 
 @app.get("/api/voice_status")
 async def get_voice_status(user: dict = Depends(get_current_user)):
     user_id = int(user["user"]["id"])
     active_sessions = []
     
-    logger.info(f"Checking voice status for user {user_id}")
+    logger.debug(f"Checking voice status for user {user_id}")
     for guild in bot_instance.guilds:
         member = guild.get_member(user_id)
         if member:
-            logger.info(f"Found member in guild {guild.name}. Voice state: {member.voice}")
+            logger.debug(f"Found member in guild {guild.name}. Voice state: {member.voice}")
             if member.voice and member.voice.channel:
                 bot_in_channel = guild.voice_client is not None and guild.voice_client.channel.id == member.voice.channel.id
                 
@@ -198,7 +359,7 @@ async def get_voice_status(user: dict = Depends(get_current_user)):
             for vc in guild.voice_channels:
                 for vc_member in vc.members:
                     if vc_member.id == user_id:
-                        logger.info(f"Found user {user_id} in voice channel {vc.name} manually!")
+                        logger.debug(f"Found user {user_id} in voice channel {vc.name} manually!")
                         bot_in_channel = guild.voice_client is not None and guild.voice_client.channel.id == vc.id
                         icon_url = str(guild.icon.url) if getattr(guild, 'icon', None) else None
                         is_admin = bot_module.is_admin_member(member)
@@ -228,7 +389,7 @@ async def verify_guild_access(guild_id: str, user: dict):
 def get_simulated_context(guild, user_data):
     # Fetch member from guild to act as context author
     user_id = int(user_data["user"]["id"])
-    member = guild.get_member(user_id)
+    member = guild.get_member(user_id) if guild else None
     if not member:
         # Fallback author using ConsoleAuthor
         member = bot_module.create_console_author()
@@ -248,8 +409,8 @@ def get_simulated_context(guild, user_data):
             member.avatar = SimulatedAvatar(avatar_url)
 
     # Use a generic channel or text channel from state
-    state = bot_module.get_music_state(guild)
-    text_channel = guild.get_channel(state.get("text_channel_id")) if state else None
+    state = bot_module.get_music_state(guild) if guild else None
+    text_channel = guild.get_channel(state.get("text_channel_id")) if (guild and state) else None
     
     ctx = bot_module.MusicContext(bot=bot_instance, guild=guild, channel=text_channel, author=member)
     return ctx
@@ -273,6 +434,9 @@ def format_song_for_api(song, guild):
     if not song:
         return None
     song_copy = dict(song)
+    if song_copy.get('requester_handle') == 'AI Auto-Queue':
+        song_copy['requester_avatar'] = '/logo_icon.svg'
+        return song_copy
     if not song_copy.get('requester_avatar') and song_copy.get('requester_id'):
         requester_id = song_copy['requester_id']
         # 1. Check guild member cache
@@ -297,12 +461,9 @@ def format_song_for_api(song, guild):
         # 3. Check active OAuth sessions
         if not song_copy.get('requester_avatar'):
             try:
-                req_str = str(requester_id)
-                for sess in SESSIONS.values():
-                    u = sess.get("user", {})
-                    if str(u.get("id")) == req_str and u.get("avatar"):
-                        song_copy['requester_avatar'] = f"https://cdn.discordapp.com/avatars/{req_str}/{u['avatar']}.png?size=64"
-                        break
+                avatar_url = db.get_user_avatar(str(requester_id))
+                if avatar_url:
+                    song_copy['requester_avatar'] = avatar_url
             except Exception:
                 pass
     return song_copy
@@ -383,9 +544,11 @@ async def get_lyrics(guild_id: str, user: dict = Depends(get_current_user)):
 @app.get("/api/stream/{guild_id}")
 async def stream_queue(guild_id: str, request: Request):
     token = request.query_params.get("token")
-    if not token or token not in SESSIONS:
+    if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    user = SESSIONS[token]
+    user = db.get_session(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Session expired or not found")
     guild = await verify_guild_access(guild_id, user)
     
     async def event_generator():
@@ -418,6 +581,13 @@ async def stream_queue(guild_id: str, request: Request):
                     resume_v = bot_module.get_skip_votes_info(guild, 'resume') if hasattr(bot_module, 'get_skip_votes_info') else (0, 0, 0)
                     stop_v = bot_module.get_skip_votes_info(guild, 'stop') if hasattr(bot_module, 'get_skip_votes_info') else (0, 0, 0)
 
+                    ai_state = _ai_autoqueue_state.get(guild_id, {})
+                    ai_auto_enabled = bool(ai_state.get("enabled", False))
+                    if not bot_connected and ai_auto_enabled:
+                        disable_autoqueue(guild_id)
+                        ai_auto_enabled = False
+                        ai_state = _ai_autoqueue_state.get(guild_id, {})
+
                     data = {
                         "queue": queue,
                         "current": current,
@@ -427,6 +597,10 @@ async def stream_queue(guild_id: str, request: Request):
                         "is_playing": state.get("is_playing", False),
                         "is_paused": is_paused,
                         "bot_connected": bot_connected,
+                        "ai_auto_enabled": ai_auto_enabled,
+                        "ai_prompt": ai_state.get("prompt", ""),
+                        "ai_set_by_name": ai_state.get("set_by_name"),
+                        "ai_set_by_avatar": ai_state.get("set_by_avatar"),
                         "position": position,
                         "skip_votes": skip_v[0],
                         "skip_votes_required": skip_v[1],
@@ -599,11 +773,38 @@ async def set_autoqueue(
     ctx = get_simulated_context(guild, user)
     await enforce_api_access(ctx, 'ai_autoqueue')
 
-    _ai_autoqueue_state[guild_id] = cfg.model_dump()
+    stored = cfg.model_dump()
+    u_data = user.get("user") if (user and isinstance(user.get("user"), dict)) else user
+    if u_data:
+        uid = u_data.get("id")
+        member = guild.get_member(int(uid)) if (guild and uid) else None
+        uname = (
+            (member.display_name if member else None)
+            or u_data.get("global_name")
+            or u_data.get("username")
+            or "User"
+        )
+        stored["set_by_name"] = uname
+        uav = u_data.get("avatar")
+        if member and hasattr(member, "display_avatar") and member.display_avatar:
+            stored["set_by_avatar"] = str(member.display_avatar.url)
+        elif uid and uav:
+            stored["set_by_avatar"] = f"https://cdn.discordapp.com/avatars/{uid}/{uav}.png?size=64"
+
+    _ai_autoqueue_state[guild_id] = stored
+    try:
+        db.save_autoqueue_config(guild_id, stored)
+    except Exception as exc:
+        logger.warning("[AI AutoQueue] Failed to persist config to DB for guild %s: %s", guild_id, exc)
+
     logger.info(
-        "[AI AutoQueue] Guild %s → enabled=%s, prompt=%r, count=%d, threshold=%d",
-        guild_id, cfg.enabled, cfg.prompt, cfg.count, cfg.threshold,
+        "[AI AutoQueue] Guild %s → enabled=%s, prompt=%r, count=%d, threshold=%d, set_by=%s (saved to SQLite)",
+        guild_id, cfg.enabled, cfg.prompt, cfg.count, cfg.threshold, stored.get("set_by_name"),
     )
+
+    if cfg.enabled and cfg.prompt:
+        asyncio.create_task(check_and_trigger_autoqueue(guild))
+
     return {"status": "ok", "config": _ai_autoqueue_state[guild_id]}
 
 
@@ -614,9 +815,17 @@ async def get_autoqueue(
 ):
     """Return current AI Auto-Queue configuration for a guild."""
     await verify_guild_access(guild_id, user)
+    if guild_id not in _ai_autoqueue_state:
+        try:
+            persisted = db.load_autoqueue_config(guild_id)
+            if persisted:
+                _ai_autoqueue_state[guild_id] = persisted
+        except Exception:
+            pass
+
     return _ai_autoqueue_state.get(
         guild_id,
-        {"enabled": False, "prompt": "", "count": 5, "threshold": 2},
+        {"enabled": False, "prompt": "", "count": 5, "threshold": 2, "set_by_name": None, "set_by_avatar": None},
     )
 
 
@@ -633,6 +842,12 @@ async def check_and_trigger_autoqueue(guild) -> bool:
     (e.g., 5 songs total with song at index 2 currently playing = 2 songs left).
     """
     if not guild or not bot_instance:
+        return False
+
+    # Do not auto-fill or consume Gemini quota if the bot is not in a voice channel
+    voice_client = getattr(guild, 'voice_client', None)
+    if not voice_client or not voice_client.is_connected():
+        disable_autoqueue(getattr(guild, 'id', None))
         return False
 
     guild_id = str(guild.id)
@@ -674,29 +889,6 @@ async def check_and_trigger_autoqueue(guild) -> bool:
     return False
 
 
-async def _ai_autoqueue_daemon() -> None:
-    """Background coroutine that monitors all guilds with AI Auto-Queue enabled.
-
-    Every 30 seconds it checks each configured guild and tops up if songs left < threshold.
-    """
-    logger.info("[AI AutoQueue] Daemon started.")
-    while not is_shutting_down:
-        try:
-            for guild_id, cfg in list(_ai_autoqueue_state.items()):
-                if not cfg.get("enabled") or not cfg.get("prompt"):
-                    continue
-                if not bot_instance:
-                    continue
-                guild = bot_instance.get_guild(int(guild_id))
-                if not guild:
-                    continue
-                await check_and_trigger_autoqueue(guild)
-        except Exception as exc:
-            logger.error("[AI AutoQueue] Daemon error: %s", exc, exc_info=True)
-
-        await asyncio.sleep(30)
-
-
 async def _daemon_fill_queue(guild, prompt: str, count: int, state: dict) -> None:
     """Generate songs with Gemini and add them directly to the guild queue."""
     recent: set[str] = {
@@ -724,6 +916,8 @@ async def _daemon_fill_queue(guild, prompt: str, count: int, state: dict) -> Non
     console_author = bot_module.create_console_author()
     console_author.display_name = "AI Auto-Queue"
     console_author.name = "AI Auto-Queue"
+    console_author.id = "ai-autoqueue"
+    console_author.mention = "AI Auto-Queue"
     text_channel = guild.get_channel(state.get("text_channel_id")) if state else None
     ctx = bot_module.MusicContext(bot=bot_instance, guild=guild, channel=text_channel, author=console_author)
 
@@ -886,10 +1080,9 @@ async def change_volume(guild_id: str, req: VolumeRequest, user: dict = Depends(
 
 _api_server = None
 _api_task = None
-_ai_autoqueue_task = None
 
 def start_api_server(host="0.0.0.0", port=8000):
-    global _api_server, _api_task, _ai_autoqueue_task, is_shutting_down
+    global _api_server, _api_task, is_shutting_down
     if _api_task and not _api_task.done():
         logger.info("API server is already running.")
         return
@@ -907,30 +1100,18 @@ def start_api_server(host="0.0.0.0", port=8000):
     )
     _api_server = uvicorn.Server(config)
     _api_task = asyncio.create_task(_api_server.serve())
-    # Start the AI Auto-Queue background daemon alongside the API server
-    if not _ai_autoqueue_task or _ai_autoqueue_task.done():
-        _ai_autoqueue_task = asyncio.create_task(_ai_autoqueue_daemon())
 
 def stop_api_server():
-    global _api_server, _ai_autoqueue_task, is_shutting_down
+    global _api_server, is_shutting_down
     is_shutting_down = True
     if _api_server:
         _api_server.should_exit = True
-    if _ai_autoqueue_task and not _ai_autoqueue_task.done():
-        _ai_autoqueue_task.cancel()
 
 async def wait_api_server_shutdown(timeout=2.0):
-    global _api_task, _api_server, _ai_autoqueue_task, is_shutting_down
+    global _api_task, _api_server, is_shutting_down
     is_shutting_down = True
     if _api_server:
         _api_server.should_exit = True
-    if _ai_autoqueue_task and not _ai_autoqueue_task.done():
-        _ai_autoqueue_task.cancel()
-        try:
-            await asyncio.wait_for(_ai_autoqueue_task, timeout=1.0)
-        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-            pass
-    _ai_autoqueue_task = None
     if _api_task and not _api_task.done():
         try:
             await asyncio.wait_for(_api_task, timeout=timeout)

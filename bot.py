@@ -10,6 +10,8 @@ import signal
 import yt_dlp
 import re
 import json
+import copy
+import urllib.parse
 from dotenv import load_dotenv
 import logging
 import importlib
@@ -30,7 +32,18 @@ load_dotenv()
 
 import settings
 
-# Configure logging with UTF-8 encoding to handle emoji and Unicode characters
+# Reconfigure stdout/stderr with UTF-8 encoding so emojis (e.g. 👋) print cleanly on Windows
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+if hasattr(sys.stderr, 'reconfigure'):
+    try:
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 # Keep a global reference to the wrapper so it is never garbage collected,
 # which prevents its __del__ from automatically closing sys.stdout.buffer!
 _GLOBAL_UTF8_STREAM = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
@@ -59,14 +72,28 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configure file handler with UTF-8 encoding to handle emoji and Unicode
-file_handler = logging.FileHandler(settings.LOG_FILE, encoding='utf-8')
+from logging.handlers import RotatingFileHandler
+
+# Configure rotating file handler (max 10MB per file, keeping 2 backups) with UTF-8 encoding
+file_handler = RotatingFileHandler(
+    settings.LOG_FILE,
+    maxBytes=10 * 1024 * 1024,
+    backupCount=2,
+    encoding='utf-8'
+)
 file_handler.setLevel(getattr(logging, settings.LOG_LEVEL, logging.INFO))
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
+logging.getLogger().addHandler(file_handler)
 
-TOKEN = os.getenv(settings.TOKEN_ENV_VAR)
+# In production mode, silence high-frequency uvicorn endpoint polling (e.g. /api/queue, /api/playback)
+if settings.RUNTIME_MODE == 'prod':
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
+TOKEN = os.getenv("DEV_DISCORD_TOKEN") or os.getenv(settings.TOKEN_ENV_VAR)
+if os.getenv("DEV_DISCORD_TOKEN"):
+    logger.info("Using DEV_DISCORD_TOKEN for Discord authentication.")
 
 # Validate token on startup
 if not TOKEN:
@@ -276,7 +303,9 @@ class BufferedAudio(discord.AudioSource):
                 logger.debug(f"Error in original source cleanup: {e}")
 
 
-intents = discord.Intents.all()
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
 
 bot = commands.Bot(command_prefix=settings.COMMAND_PREFIX, intents=intents)
 
@@ -298,6 +327,104 @@ if settings.CONSOLE_USER_ID is not None:
 ytdl = yt_dlp.YoutubeDL(settings.YTDL_OPTIONS)
 search_ytdl = yt_dlp.YoutubeDL(getattr(settings, 'SEARCH_YTDL_OPTIONS', settings.YTDL_OPTIONS))
 playlist_ytdl = yt_dlp.YoutubeDL(settings.PLAYLIST_YTDL_OPTIONS)
+
+_ytdl_client_cache: dict[tuple, yt_dlp.YoutubeDL] = {}
+YTDL_CLIENT_TIERS = [None, 'ios', 'android', 'mweb']
+
+
+def get_cached_ytdl(client_tag: str | None = None, is_search: bool = False, is_playlist: bool = False) -> yt_dlp.YoutubeDL:
+    """Return cached YoutubeDL instance tailored for specific client tag (None=default, ios, android, mweb)."""
+    key = (client_tag, is_search, is_playlist)
+    if key in _ytdl_client_cache:
+        return _ytdl_client_cache[key]
+
+    if is_playlist:
+        opts = copy.deepcopy(settings.PLAYLIST_YTDL_OPTIONS)
+    elif is_search:
+        opts = copy.deepcopy(getattr(settings, 'SEARCH_YTDL_OPTIONS', settings.YTDL_OPTIONS))
+    else:
+        opts = copy.deepcopy(settings.YTDL_OPTIONS)
+
+    if client_tag:
+        opts.setdefault('extractor_args', {})['youtube'] = {'player_client': [client_tag]}
+    else:
+        if 'extractor_args' in opts and 'youtube' in opts['extractor_args']:
+            opts['extractor_args']['youtube'].pop('player_client', None)
+
+    inst = yt_dlp.YoutubeDL(opts)
+    _ytdl_client_cache[key] = inst
+    return inst
+
+
+def is_valid_audio_extract(info: dict) -> bool:
+    """Validate that extracted metadata contains real streamable audio, not empty or SABR stubs."""
+    if not isinstance(info, dict):
+        return False
+    if 'entries' in info:
+        entries = info.get('entries')
+        if not entries:
+            return False
+        info = entries[0]
+        if not isinstance(info, dict):
+            return False
+
+    url = info.get('url')
+    if not url:
+        return False
+
+    # Must have an audio codec
+    acodec = info.get('acodec')
+    if acodec in (None, 'none'):
+        return False
+
+    # Detect SABR truncated video stubs (e.g. 92KB file for a 3-minute song)
+    duration = info.get('duration') or 0
+    filesize = info.get('filesize') or info.get('filesize_approx') or 0
+    if duration > 25 and 0 < filesize < 160_000:
+        return False
+
+    if 'clen=' in url:
+        try:
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+            clen = qs.get('clen', [None])[0]
+            if clen and clen.isdigit() and duration > 25 and 0 < int(clen) < 160_000:
+                return False
+        except Exception:
+            pass
+
+    return True
+
+
+_original_ytdl_extract_info = ytdl.extract_info
+
+
+def extract_info_with_fallback(url: str, download: bool = False, is_search: bool = False, is_playlist: bool = False, **kwargs) -> dict:
+    """Extract YouTube info trying multiple client tiers (default, ios, android, mweb) to resist bot-detection and SABR stubs."""
+    is_yt = isinstance(url, str) and ('youtube.com' in url or 'youtu.be' in url or url.startswith('ytsearch:'))
+    tiers = YTDL_CLIENT_TIERS if is_yt else [None]
+
+    last_error = None
+    for client_name in tiers:
+        name = client_name or 'default'
+        try:
+            ydl_inst = get_cached_ytdl(client_tag=client_name, is_search=is_search, is_playlist=is_playlist)
+            info = ydl_inst.extract_info(url, download=download, **kwargs)
+            if is_playlist or is_search or is_valid_audio_extract(info):
+                if client_name is not None:
+                    logger.info("[yt-dlp] Extracted %r using fallback client tier '%s'", url[:60], name)
+                return info
+            else:
+                logger.warning("[yt-dlp] Client tier '%s' returned truncated/stub audio for %r. Retrying with next client...", name, url[:60])
+        except Exception as exc:
+            logger.warning("[yt-dlp] Client tier '%s' failed for %r: %s. Retrying with next client...", name, url[:60], exc)
+            last_error = exc
+
+    if last_error:
+        raise last_error
+    raise RuntimeError(f"All extraction client tiers failed for {url}")
+
+
+ytdl.extract_info = extract_info_with_fallback
 
 # GLOBAL VARIABLES
 music_state_by_guild = {}
@@ -402,12 +529,8 @@ def get_music_state(guild):
     return state
 
 
-def save_state_to_disk():
-    """Atomically save persistent music states to disk."""
-    state_path = getattr(settings, 'STATE_FILE', None)
-    if not state_path:
-        return
-
+def save_state_to_disk(blocking: bool = False):
+    """Atomically save persistent music states to SQLite database."""
     try:
         data_to_save = {}
         for guild_id, state in music_state_by_guild.items():
@@ -421,11 +544,14 @@ def save_state_to_disk():
                     'queue_id': s.get('queue_id'),
                     'type': s.get('type'),
                     'title': s.get('title'),
+                    'artist': s.get('artist'),
+                    'thumbnail': clean_thumbnail_url(s.get('thumbnail')),
                     'data': s.get('data'),
                     'duration': s.get('duration'),
                     'requester_id': s.get('requester_id'),
                     'requester_mention': s.get('requester_mention'),
                     'requester_handle': s.get('requester_handle'),
+                    'requester_avatar': s.get('requester_avatar'),
                 })
 
             manual_stop = bool(state.get('manual_stop', False))
@@ -444,35 +570,42 @@ def save_state_to_disk():
                 'saved_at': saved_at,
             }
 
-        parent_dir = os.path.dirname(state_path)
-        if parent_dir and not os.path.exists(parent_dir):
-            os.makedirs(parent_dir, exist_ok=True)
-
-        def _write_to_disk(save_data, final_path):
+        def _persist_to_sqlite(save_data):
             try:
-                temp_path = f"{final_path}.tmp"
-                with open(temp_path, 'w', encoding='utf-8') as f:
-                    json.dump(save_data, f, indent=2, ensure_ascii=False)
-                os.replace(temp_path, final_path)
-                logger.debug("Saved queue state to %s (%d guilds)", final_path, len(save_data))
+                import db
+                db.save_guild_music_states(save_data)
+                logger.debug("Saved queue state to SQLite (%d guilds)", len(save_data))
             except Exception as e:
-                logger.warning(f"Failed to save queue state: {e}")
+                logger.warning(f"Failed to save queue state to SQLite: {e}")
 
-        threading.Thread(target=_write_to_disk, args=(data_to_save, state_path), daemon=True).start()
+        if blocking:
+            _persist_to_sqlite(data_to_save)
+        else:
+            threading.Thread(target=_persist_to_sqlite, args=(data_to_save,), daemon=True).start()
     except Exception as e:
         logger.warning(f"Failed to prepare queue state for saving: {e}")
 
 
 def load_state_from_disk():
-    """Load persistent music states from disk on startup."""
+    """Load persistent music states from SQLite database (with automatic legacy JSON migration)."""
     global next_queue_id
-    state_path = getattr(settings, 'STATE_FILE', None)
-    if not state_path or not os.path.exists(state_path):
-        return
-
     try:
-        with open(state_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        import db
+        data = db.load_guild_music_states()
+        source = "SQLite database (musicbot.db)"
+
+        # On initial migration, import from legacy queue_state.json if SQLite is empty
+        if not data:
+            state_path = getattr(settings, 'STATE_FILE', None)
+            if state_path and os.path.exists(state_path):
+                try:
+                    with open(state_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    if isinstance(data, dict) and data:
+                        source = f"legacy {state_path} (migrated to SQLite)"
+                        db.save_guild_music_states(data)
+                except Exception as ex:
+                    logger.warning(f"Failed to read legacy {state_path}: {ex}")
 
         if not isinstance(data, dict):
             return
@@ -521,9 +654,10 @@ def load_state_from_disk():
             }
 
         next_queue_id = max(next_queue_id, max_qid)
-        logger.info(f"Loaded persistent music state for {len(music_state_by_guild)} guild(s) from {state_path}")
+        logger.info(f"Loaded persistent music state for {len(music_state_by_guild)} guild(s) from {source}")
     except Exception as e:
-        logger.warning(f"Failed to load persistent queue state from {state_path}: {e}")
+        logger.warning(f"Failed to load persistent queue state: {e}")
+
 
 
 def update_music_state_channels(guild, voice_channel=None, text_channel=None):
@@ -570,6 +704,12 @@ def clear_music_state(guild):
     guild_id = getattr(guild, 'id', None)
     if guild_id:
         cancel_voice_recovery(guild_id)
+        try:
+            import api
+            if hasattr(api, 'disable_autoqueue'):
+                api.disable_autoqueue(guild_id)
+        except Exception:
+            pass
     state = get_music_state(guild)
     if state is not None:
         state['queue'].clear()
@@ -865,9 +1005,19 @@ class ConsoleChannel:
                 parts.append(embed.description)
             if getattr(embed, 'footer', None) and getattr(embed.footer, 'text', None):
                 parts.append(f"[{embed.footer.text}]")
-            content = "\n".join(parts) if parts else str(embed)
         if content is not None:
-            print(f"[{self.label}] {content}")
+            text = f"[{self.label}] {content}\n"
+            try:
+                _GLOBAL_UTF8_STREAM.write(text)
+                _GLOBAL_UTF8_STREAM.flush()
+            except Exception:
+                try:
+                    # Fallback to ascii/unicode replacement if stream buffer is detached
+                    sys.stdout.buffer.write(text.encode('utf-8', errors='replace'))
+                    sys.stdout.buffer.flush()
+                except Exception:
+                    # Last resort fallback: replace unencodable characters
+                    print(text.encode('ascii', errors='backslashreplace').decode('ascii'), end='')
         return ConsoleMessage(content=content, channel=self)
 
 
@@ -1421,6 +1571,18 @@ def make_song(song_type, title, data, requester):
     return song
 
 
+def clean_thumbnail_url(thumb: str | None, video_id: str | None = None) -> str | None:
+    """Normalize YouTube thumbnail URLs away from 4:3 letterboxed hqdefault to 16:9 maxresdefault."""
+    if not thumb and video_id:
+        return f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg"
+    if not thumb:
+        return None
+    thumb_str = str(thumb).strip()
+    if "/hqdefault.jpg" in thumb_str:
+        return thumb_str.replace("/hqdefault.jpg", "/maxresdefault.jpg")
+    return thumb_str
+
+
 def is_admin_member(member):
     """Return True ONLY if the Discord member is the bot owner defined by USER_ID in .env."""
     if member is None:
@@ -1942,6 +2104,12 @@ async def play_next(ctx):
 async def on_ready():
     logger.info(f'Logged in as {bot.user}')
     start_console_command_bridge()
+    try:
+        import api
+        if hasattr(api, 'reset_all_autoqueue'):
+            api.reset_all_autoqueue()
+    except Exception:
+        pass
     if settings.AUTO_RESUME_PLAYBACK:
         await check_and_resume_all_sessions()
 
@@ -1973,9 +2141,36 @@ async def on_command_error(ctx, error):
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    """Auto-disconnect after delay when the bot is alone in voice."""
+    """Auto-disconnect after delay when the bot is alone in voice, and disable autoqueue on leave."""
+    if getattr(bot, 'user', None) and member.id == bot.user.id:
+        if before.channel is not None and after.channel is None:
+            # Bot disconnected from voice channel in this guild
+            guild_id = getattr(member, 'guild', None) and getattr(member.guild, 'id', None)
+            if guild_id:
+                try:
+                    import api
+                    if hasattr(api, 'disable_autoqueue'):
+                        api.disable_autoqueue(guild_id)
+                except Exception:
+                    pass
+
     # Re-evaluate timer whenever anyone moves/joins/leaves voice in this guild.
     ensure_empty_voice_leave_timer(member.guild)
+
+
+@bot.event
+async def on_guild_remove(guild):
+    """Handle bot being removed or kicked from a guild."""
+    guild_id = getattr(guild, 'id', None)
+    logger.info("Bot removed from guild %s (%s).", guild_id, getattr(guild, 'name', 'unknown'))
+    clear_music_state(guild)
+    if guild_id:
+        try:
+            import api
+            if hasattr(api, 'disable_autoqueue'):
+                api.disable_autoqueue(guild_id)
+        except Exception:
+            pass
 
 # --- COMMANDS ---
 
@@ -2109,7 +2304,7 @@ async def enqueue_single_song_from_url(ctx, title, webpage_url, video_data=None)
             song_obj['stream_url_cached_at'] = time.time()
         song_obj['format_id'] = video_data.get('format_id')
         if video_data.get('thumbnail'):
-            song_obj['thumbnail'] = video_data.get('thumbnail')
+            song_obj['thumbnail'] = clean_thumbnail_url(video_data.get('thumbnail'), video_data.get('id'))
             
         artist = video_data.get('artist') or video_data.get('creator') or video_data.get('uploader') or video_data.get('channel')
         if artist:
@@ -2167,7 +2362,7 @@ async def enqueue_playlist_tracks(ctx, playlist_title, raw_entries):
         song_obj = make_song('youtube', entry_title, entry_url, ctx.author)
         song_obj['duration'] = entry.get('duration')
         if entry.get('thumbnail'):
-            song_obj['thumbnail'] = entry.get('thumbnail')
+            song_obj['thumbnail'] = clean_thumbnail_url(entry.get('thumbnail'), entry.get('id'))
             
         artist = entry.get('artist') or entry.get('creator') or entry.get('uploader') or entry.get('channel')
         if artist:
@@ -2432,7 +2627,7 @@ async def yt(ctx, *, query):
             song_obj['stream_url_cached_at'] = time.time()
         song_obj['format_id'] = video_data.get('format_id')
         if video_data.get('thumbnail'):
-            song_obj['thumbnail'] = video_data.get('thumbnail')
+            song_obj['thumbnail'] = clean_thumbnail_url(video_data.get('thumbnail'), video_data.get('id'))
             
         artist = video_data.get('artist') or video_data.get('creator') or video_data.get('uploader') or video_data.get('channel')
         if artist:
@@ -3391,6 +3586,14 @@ async def perform_graceful_shutdown():
         return
     _shutdown_lock = True
     logger.info("Received shutdown signal, shutting down gracefully...")
+
+    # Force close watchdog: If graceful cleanup hangs for more than 5 seconds, force terminate the process
+    def _force_exit_watchdog():
+        time.sleep(5.0)
+        logger.warning("Graceful shutdown timed out after 5s. Forcefully terminating process...")
+        os._exit(0)
+
+    threading.Thread(target=_force_exit_watchdog, daemon=True, name="ShutdownForceWatchdog").start()
     try:
         import api
         if hasattr(api, 'wait_api_server_shutdown'):
@@ -3412,7 +3615,7 @@ async def perform_graceful_shutdown():
         except Exception:
             pass
 
-    save_state_to_disk()
+    save_state_to_disk(blocking=True)
 
     try:
         if not bot.is_closed():
@@ -3463,7 +3666,23 @@ async def main():
         except (KeyboardInterrupt, asyncio.CancelledError):
             await perform_graceful_shutdown()
             break
-        except Exception as e:
+        except discord.errors.PrivilegedIntentsRequired as e:
+            logger.critical(
+                f"\n{'='*70}\n"
+                f"[DISCORD CONFIGURATION REQUIRED]\n"
+                f"Your Discord Bot application requires Privileged Gateway Intents:\n"
+                f"{e}\n\n"
+                f"How to fix in 10 seconds:\n"
+                f"1. Open https://discord.com/developers/applications/\n"
+                f"2. Select your application\n"
+                f"3. Click 'Bot' in the left sidebar\n"
+                f"4. Scroll down to 'Privileged Gateway Intents'\n"
+                f"5. Toggle ON 'Message Content Intent' and 'Server Members Intent'\n"
+                f"6. Click 'Save Changes' at the bottom of the page, then restart.\n"
+                f"{'='*70}\n"
+            )
+            await perform_graceful_shutdown()
+            break
             if not settings.AUTO_RECONNECT:
                 logger.error(f"Fatal error (auto-reconnect disabled): {e}", exc_info=True)
                 raise
@@ -3479,7 +3698,7 @@ async def main():
             await asyncio.sleep(retry_delay)
             retry_delay = min(retry_delay * 1.5, settings.RECONNECT_DELAY_MAX)
         finally:
-            save_state_to_disk()
+            save_state_to_disk(blocking=True)
 
     stop_console_command_bridge()
 

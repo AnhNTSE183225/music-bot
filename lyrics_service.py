@@ -22,39 +22,101 @@ def extract_video_id(url: str):
     return match.group(1) if match else None
 
 
-def clean_song_metadata(title: str, artist: str = ''):
-    """Clean YouTube title clutter and extract best-effort (artist, track)."""
-    title = str(title or '').strip()
-    artist = str(artist or '').strip()
+# Common game publisher, curator, and record label channels whose names are not the primary music artist
+PUBLISHER_CHANNELS = {
+    'league of legends', 'riot games music', 'riot games', 'valorant',
+    'genshin impact', 'hoyoverse', 'honkai: star rail', 'monstercat',
+    'ncs', 'no copyright sounds', 'lolesports', 'world of warcraft',
+    'overwatch', 'blizzard entertainment', 'apex legends', 'fortnite',
+    'cyberpunk 2077', 'cd projekt red'
+}
 
-    # Split sub-titles / anthem tags separated by ' // '
-    if ' // ' in title:
-        title = title.split(' // ', 1)[0].strip()
+EVENT_KEYWORDS = re.compile(
+    r'(?i)\b(worlds?\s*\d*|anthem|champion\s*theme|season\s*\d*|cinematic|original\s*soundtrack|ost|audio|official)\b'
+)
 
-    # Remove common video tags: [Official Video], (Audio), (MV), etc.
-    cleaned = re.sub(r'\[.*?\]|\(.*?\)', '', title)
+
+def extract_song_candidates(title: str, artist: str = '') -> list[tuple[str, str]]:
+    """Extract ordered (artist, title) candidate pairs from a YouTube title and channel name.
+
+    Handles standard 'Artist - Title', featured artists '(ft. Imagine Dragons)',
+    and publisher/event compound titles like 'Warriors (ft. Imagine Dragons) | Worlds 2014 - League of Legends'.
+    """
+    orig_title = str(title or '').strip()
+    channel = str(artist or '').strip()
+    channel_lower = channel.lower()
+
+    # 1. Extract featured artist inside parens/brackets: (ft. Imagine Dragons) -> Imagine Dragons
+    feat_match = re.search(r'(?i)[\(\[]\s*(?:ft|feat|featuring)\.?\s*([^\)\]]+)[\)\]]', orig_title)
+    feat_artist = feat_match.group(1).strip() if feat_match else ''
+
+    # 2. Strip video tags and clauses
+    cleaned = re.sub(r'\[.*?\]|\(.*?\)', '', orig_title)
     cleaned = re.sub(
         r'(?i)\b(official\s+video|official\s+audio|official\s+music\s+video|lyric\s+video|lyrics|mv|hd|4k|audio|visualizer)\b',
         '',
         cleaned,
     )
-    # Remove featuring clauses (e.g. ft. / feat. / featuring)
     cleaned = re.sub(r'(?i)\b(ft|feat|featuring)\b\.?.*', '', cleaned)
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
 
-    # If title has "Artist - Track" or "Artist | Track"
-    if ' - ' in cleaned:
-        parts = cleaned.split(' - ', 1)
-        parsed_artist = parts[0].strip()
-        parsed_title = parts[1].strip()
-        return (artist or parsed_artist), parsed_title
-    elif ' | ' in cleaned:
-        parts = cleaned.split(' | ', 1)
-        parsed_artist = parts[0].strip()
-        parsed_title = parts[1].strip()
-        return (artist or parsed_artist), parsed_title
+    # 3. Split parts by delimiters: ' - ', ' | ', ' // '
+    parts = [p.strip() for p in re.split(r'\s*(?: - | \| | // )\s*', cleaned) if p.strip()]
 
-    return artist, cleaned
+    candidates: list[tuple[str, str]] = []
+    seen = set()
+
+    def add_cand(cand_art: str, cand_title: str):
+        ca = cand_art.strip()
+        ct = cand_title.strip()
+        if not ct:
+            return
+        key = (ca.lower(), ct.lower())
+        if key not in seen:
+            seen.add(key)
+            candidates.append((ca, ct))
+
+    # If featured artist exists, it is very often the actual band/singer performing the song
+    if feat_artist and parts:
+        add_cand(feat_artist, parts[0])
+
+    is_publisher = any(pub in channel_lower for pub in PUBLISHER_CHANNELS)
+
+    if len(parts) >= 2:
+        # Meaningful parts without event noise (e.g. ['Linkin Park', 'Heavy Is the Crown'])
+        meaningful_parts = [p for p in parts if not EVENT_KEYWORDS.search(p)]
+
+        if len(meaningful_parts) >= 2:
+            add_cand(meaningful_parts[0], meaningful_parts[1])
+            add_cand(meaningful_parts[1], meaningful_parts[0])
+
+        # Standard (part 0, part 1) and reverse
+        add_cand(parts[0], parts[1])
+        add_cand(parts[1], parts[0])
+
+        # If channel is given and not an event tag
+        if channel and not EVENT_KEYWORDS.search(channel):
+            for mp in (meaningful_parts or parts):
+                add_cand(channel, mp)
+
+        # If 3 parts, e.g. 'Warriors | Worlds 2014 - League of Legends'
+        if len(parts) >= 3:
+            add_cand(parts[-1], parts[0])
+            add_cand(parts[0], parts[-1])
+    elif parts:
+        if channel:
+            add_cand(channel, parts[0])
+        add_cand('', parts[0])
+
+    return candidates
+
+
+def clean_song_metadata(title: str, artist: str = ''):
+    """Clean YouTube title clutter and extract best-effort (artist, track)."""
+    candidates = extract_song_candidates(title, artist)
+    if candidates:
+        return candidates[0]
+    return (str(artist or '').strip(), str(title or '').strip())
 
 
 def parse_timestamp(val):
@@ -99,16 +161,46 @@ def parse_ttml(ttml_xml: str):
 
             words = []
             span_elements = p.findall('.//{http://www.w3.org/ns/ttml}span') or p.findall('.//span')
+
+            # Leading text before first span if present
+            if p.text and p.text.strip():
+                first_begin = parse_timestamp(span_elements[0].attrib.get('begin', begin)) if span_elements else end
+                words.append({
+                    'begin': round(begin, 3),
+                    'end': round(first_begin, 3),
+                    'text': p.text.strip(),
+                    'trailing_space': bool(p.text.endswith(' ') or p.text.endswith('\t')),
+                })
+
             for span in span_elements:
                 w_begin = parse_timestamp(span.attrib.get('begin', begin))
                 w_end = parse_timestamp(span.attrib.get('end', end))
                 w_text = ''.join(span.itertext())
-                if w_text.strip():
+                tail = span.tail or ''
+                has_space = bool(w_text.endswith(' ') or re.search(r'\s', tail))
+                clean_text = w_text.strip()
+                if clean_text:
                     words.append({
                         'begin': round(w_begin, 3),
                         'end': round(w_end, 3),
-                        'text': w_text,
+                        'text': clean_text,
+                        'trailing_space': has_space,
                     })
+
+            # Align with line_text to guarantee accurate word boundaries
+            pos = 0
+            for i, w in enumerate(words):
+                idx = line_text.find(w['text'], pos)
+                if idx != -1:
+                    after_pos = idx + len(w['text'])
+                    if after_pos < len(line_text):
+                        w['trailing_space'] = line_text[after_pos].isspace()
+                    else:
+                        w['trailing_space'] = True
+                    pos = after_pos
+                else:
+                    if 'trailing_space' not in w:
+                        w['trailing_space'] = (i == len(words) - 1)
 
             lines.append({
                 'begin': round(begin, 3),
@@ -372,13 +464,25 @@ def get_lyrics_for_song(title: str, artist: str = '', duration: int = 0, url: st
     if video_id:
         result = fetch_unison(video_id)
 
-    # Step 2: Try BetterLyrics (syllable-level TTML)
-    if not result:
-        result = fetch_betterlyrics(clean_title, clean_artist, duration)
+    # Step 2 & 3: Try candidates with BetterLyrics and LRCLIB
+    candidates = extract_song_candidates(title, artist)
+    resolved_artist, resolved_title = clean_artist, clean_title
 
-    # Step 3: Try LRCLIB (line-level LRC)
     if not result:
-        result = fetch_lrclib(clean_title, clean_artist, duration)
+        # First pass: try high-fidelity syllable-level BetterLyrics across all candidate pairs
+        for cand_artist, cand_title in candidates:
+            result = fetch_betterlyrics(cand_title, cand_artist, duration)
+            if result:
+                resolved_artist, resolved_title = cand_artist, cand_title
+                break
+
+    if not result:
+        # Second pass: try line-level LRCLIB across candidate pairs
+        for cand_artist, cand_title in candidates:
+            result = fetch_lrclib(cand_title, cand_artist, duration)
+            if result:
+                resolved_artist, resolved_title = cand_artist, cand_title
+                break
 
     # Step 4: Detect MV intro offset via SponsorBlock
     intro_offset = 0.0
@@ -390,8 +494,8 @@ def get_lyrics_for_song(title: str, artist: str = '', duration: int = 0, url: st
     if result:
         result['intro_offset'] = intro_offset
         result['video_id'] = video_id
-        result['track_title'] = clean_title
-        result['track_artist'] = clean_artist
+        result['track_title'] = resolved_title
+        result['track_artist'] = resolved_artist
 
         # Maintain cache size
         if len(_lyrics_cache) > MAX_CACHE_SIZE:

@@ -1,7 +1,36 @@
 #!/usr/bin/env bash
 # MusicBot Linux Runner - Handles system deps, venv setup, and background execution
 
+# Ensure logs directory exists
+LOGS_DIR="./logs"
+SAVE_DIR="./logs-saved"
+if [ ! -d "$LOGS_DIR" ]; then
+    mkdir -p "$LOGS_DIR"
+fi
+
+# Mount tmpfs (RAM disk) for ./logs on Linux if not already mounted to eliminate USB flash wear
+if ! mountpoint -q "$LOGS_DIR" 2>/dev/null; then
+    if sudo -n mount -t tmpfs -o size=64M,noatime,nosuid tmpfs "$LOGS_DIR" 2>/dev/null; then
+        echo -e "\e[32mOK: Mounted RAM disk (tmpfs) on $LOGS_DIR to eliminate USB flash wear.\e[0m"
+    fi
+fi
+
+# Persist RAM logs to disk on exit or crash
+save_crash_logs() {
+    mkdir -p "$SAVE_DIR"
+    if [ -d "$LOGS_DIR" ]; then
+        cp -f "$LOGS_DIR"/*.log "$SAVE_DIR/" 2>/dev/null || true
+    fi
+}
+trap save_crash_logs EXIT INT TERM
+
+START_LOG_FILE="$LOGS_DIR/start-linux.log"
+
+# Tee all script output to start-linux.log while maintaining terminal output
+exec > >(tee -a "$START_LOG_FILE") 2>&1
+
 echo -e "\e[36mMusicBot Linux Background Runner\e[0m\n"
+echo "Logging start-linux execution to $START_LOG_FILE"
 
 # Configure which config file to use (e.g., config.prod.yaml)
 export MUSICBOT_CONFIG_FILE="config.prod.yaml"
@@ -125,11 +154,6 @@ if [ $? -eq 0 ] && [ -n "$MODE_CANDIDATE" ]; then
     fi
 fi
 
-LOGS_DIR="./logs"
-if [ ! -d "$LOGS_DIR" ]; then
-    mkdir -p "$LOGS_DIR"
-fi
-
 TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
 PROD_LOG_FILE="$LOGS_DIR/musicbot-prod.log"
 
@@ -140,12 +164,14 @@ if [ "$RUNTIME_MODE" = "debug" ]; then
     export MUSICBOT_PLAYBACK_DEBUG_METRICS="true"
     export MUSICBOT_LOG_FILE="$DEBUG_LOG_FILE"
     echo -e "\e[33mRuntime mode: DEBUG\e[0m"
+    echo -e "\e[33mApp log file: $DEBUG_LOG_FILE\e[0m"
 else
     export MUSICBOT_RUNTIME_MODE="prod"
     export MUSICBOT_LOG_LEVEL="INFO"
     export MUSICBOT_PLAYBACK_DEBUG_METRICS="false"
     export MUSICBOT_LOG_FILE="$PROD_LOG_FILE"
     echo -e "\e[32mRuntime mode: PROD\e[0m"
+    echo -e "\e[32mApp log file: $PROD_LOG_FILE\e[0m"
 fi
 
 # Starting Bot in Background (stops any existing instance first)
@@ -161,17 +187,18 @@ if [ -f bot.pid ] && kill -0 $(cat bot.pid) 2>/dev/null; then
 fi
 
 echo -e "\e[36mStarting bot in the background...\e[0m"
+export PYTHONUNBUFFERED=1
 # We pipe /dev/null to stdin to cleanly disable console bridge
-nohup $VENV_PYTHON ./bot.py < /dev/null > bot_runner.log 2>&1 &
+nohup $VENV_PYTHON -u ./bot.py < /dev/null > "$LOGS_DIR/bot_runner.log" 2>&1 &
 BOT_PID=$!
 echo $BOT_PID > bot.pid
 sleep 2
 if ! kill -0 $BOT_PID 2>/dev/null; then
     echo -e "\e[31mERROR: Bot failed to start! Last lines of bot_runner.log:\e[0m"
-    tail -n 25 bot_runner.log
+    tail -n 25 "$LOGS_DIR/bot_runner.log"
     exit 1
 fi
-echo -e "\e[32mBot started (PID $BOT_PID)! Check bot_runner.log and logs/ for output.\e[0m"
+echo -e "\e[32mBot started (PID $BOT_PID)! Runner log: $LOGS_DIR/bot_runner.log, App log: $MUSICBOT_LOG_FILE\e[0m"
 
 # Starting Tailscale Funnel in Background
 if [ -f tailscale_funnel.pid ] && kill -0 $(cat tailscale_funnel.pid) 2>/dev/null; then
@@ -180,9 +207,9 @@ else
     echo -e "\e[36mStarting Tailscale Funnel on port 8000...\e[0m"
     # Refresh sudo credentials in the foreground so the background process doesn't get stuck asking for a password
     sudo -v
-    sudo tailscale funnel 8000 > tailscale_funnel.log 2>&1 &
+    sudo tailscale funnel 8000 > "$LOGS_DIR/tailscale_funnel.log" 2>&1 &
     echo $! > tailscale_funnel.pid
-    echo -e "\e[32mTailscale funnel started! Logs are in tailscale_funnel.log\e[0m"
+    echo -e "\e[32mTailscale funnel started! Logs are in $LOGS_DIR/tailscale_funnel.log\e[0m"
 fi
 
 echo -e "\n\e[32mAll services started successfully in the background!\e[0m"

@@ -1,0 +1,71 @@
+name: Deploy to Linux Server
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to Server via SSH
+        env:
+          ENV_SECRET: ${{ secrets.ENV }}
+        run: |
+          # 1. Parse SSH credentials from the ENV secret
+          SSH_HOST=$(echo "$ENV_SECRET" | grep -E '^SSH_HOST=' | head -n1 | cut -d '=' -f2- | tr -d '\r' | xargs)
+          SSH_USER=$(echo "$ENV_SECRET" | grep -E '^SSH_USER=' | head -n1 | cut -d '=' -f2- | tr -d '\r' | xargs)
+          SSH_PASSWORD=$(echo "$ENV_SECRET" | grep -E '^SSH_PASSWORD=' | head -n1 | cut -d '=' -f2- | tr -d '\r' | xargs)
+          SSH_PORT=$(echo "$ENV_SECRET" | grep -E '^SSH_PORT=' | head -n1 | cut -d '=' -f2- | tr -d '\r' | xargs)
+
+          if [ -z "$SSH_HOST" ]; then
+            echo "ERROR: SSH_HOST not found in secret ENV!"
+            exit 1
+          fi
+
+          if [ -z "$SSH_USER" ]; then
+            SSH_USER="theanh"
+          fi
+
+          if [ -z "$SSH_PORT" ]; then
+            SSH_PORT="22"
+          fi
+
+          echo "Target host: $SSH_HOST (user: $SSH_USER, port: $SSH_PORT)"
+
+          # 2. Install sshpass
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+
+          # 3. Create cleaned .env file for the application on runner
+          echo "$ENV_SECRET" | tr -d '\r' | grep -v -E '^SSH_(HOST|USER|PASSWORD|PORT)=' > app.env
+
+          # 4. Copy app.env to the server
+          SSHPASS="$SSH_PASSWORD" sshpass -e scp -o StrictHostKeyChecking=no -P "$SSH_PORT" app.env "$SSH_USER@$SSH_HOST:~/workspace/music-bot/.env.new"
+
+          # 5. Execute deployment commands remotely over SSH
+          SSHPASS="$SSH_PASSWORD" sshpass -e ssh -o StrictHostKeyChecking=no -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "
+            set -e
+            echo '=== Starting Automated Deployment on Server ==='
+            cd ~/workspace/music-bot || { echo 'Directory ~/workspace/music-bot not found!'; exit 1; }
+
+            echo '1. Cleaning local changes & hard-resetting to origin/main...'
+            git fetch origin main
+            git clean -df
+            git reset --hard origin/main
+
+            echo '2. Wiping old .env and activating fresh configuration...'
+            [ -f .env ] && cp -f .env .env.bak || true
+            rm -f .env
+            mv -f .env.new .env
+
+            echo '3. Stopping old services...'
+            ./stop-linux.sh || true
+            pkill -f 'python.*bot.py' || true
+
+            echo '4. Starting services...'
+            ./start-linux.sh
+
+            echo '=== Deployment Succeeded! ==='
+          "
