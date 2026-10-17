@@ -14,6 +14,7 @@ import sys
 bot_module = sys.modules.get('__main__')
 import settings
 import lyrics_service
+import ai_service
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,27 @@ class AddSongRequest(BaseModel):
 
 class VolumeRequest(BaseModel):
     volume: int
+
+class IndexRequest(BaseModel):
+    index: int
+
+# ---------------------------------------------------------------------------
+# AI Auto-Queue — models and in-memory state
+# ---------------------------------------------------------------------------
+
+class AISearchRequest(BaseModel):
+    prompt: str
+    count: int = 5        # how many songs to suggest / add per fill
+    threshold: int = 2    # auto-fill trigger: when queue length falls below this
+
+class AIAutoQueueConfig(BaseModel):
+    enabled: bool
+    prompt: str
+    count: int = 5
+    threshold: int = 2
+
+# guild_id -> {enabled, prompt, count, threshold}
+_ai_autoqueue_state: dict[str, dict] = {}
 
 @app.get("/login")
 def login():
@@ -429,6 +451,178 @@ async def add_song(guild_id: str, req: AddSongRequest, user: dict = Depends(get_
         logger.error(f"Error adding song: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ---------------------------------------------------------------------------
+# AI Auto-Queue endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/ai/{guild_id}/suggest")
+async def ai_suggest(
+    guild_id: str,
+    req: AISearchRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Ask Gemini to suggest songs based on a prompt. Returns a preview list — nothing is added yet."""
+    guild = await verify_guild_access(guild_id, user)
+    ctx = get_simulated_context(guild, user)
+    await enforce_api_access(ctx, 'ai_autoqueue')
+
+    # Collect titles already in the queue to avoid suggestions duplicating existing tracks
+    state = bot_module.get_music_state(guild) or {}
+    recent: set[str] = {
+        (s.get("title") or "").lower().strip()
+        for s in state.get("queue", [])
+    }
+    if state.get("current_song"):
+        recent.add((state["current_song"].get("title") or "").lower().strip())
+
+    try:
+        # Ask Gemini for 2× more queries than songs needed so we have fallback candidates
+        query_count = max(req.count * 2, 8)
+        queries = await ai_service.generate_search_queries(req.prompt, count=query_count)
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        logger.error("[AI] Gemini error: %s", exc)
+        raise HTTPException(status_code=502, detail="AI service unavailable")
+
+    songs = await ai_service.search_songs(
+        queries,
+        max_per_query=2,
+        blacklist_patterns=list(settings.YT_BLACKLIST_PATTERNS or []),
+        recent_titles=recent,
+    )
+    # Return a few extra so the user can choose which to remove before adding
+    return {"songs": songs[: req.count + 3], "prompt": req.prompt}
+
+
+@app.post("/api/ai/{guild_id}/confirm")
+async def ai_confirm(
+    guild_id: str,
+    req: AddSongRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Add a single AI-suggested song URL to the queue. Delegates to the existing add_song logic."""
+    return await add_song(guild_id, req, user)
+
+
+@app.post("/api/ai/{guild_id}/autoqueue")
+async def set_autoqueue(
+    guild_id: str,
+    cfg: AIAutoQueueConfig,
+    user: dict = Depends(get_current_user),
+):
+    """Enable or disable AI Auto-Queue daemon for a guild and set its parameters."""
+    guild = await verify_guild_access(guild_id, user)
+    ctx = get_simulated_context(guild, user)
+    await enforce_api_access(ctx, 'ai_autoqueue')
+
+    _ai_autoqueue_state[guild_id] = cfg.model_dump()
+    logger.info(
+        "[AI AutoQueue] Guild %s → enabled=%s, prompt=%r, count=%d, threshold=%d",
+        guild_id, cfg.enabled, cfg.prompt, cfg.count, cfg.threshold,
+    )
+    return {"status": "ok", "config": _ai_autoqueue_state[guild_id]}
+
+
+@app.get("/api/ai/{guild_id}/autoqueue")
+async def get_autoqueue(
+    guild_id: str,
+    user: dict = Depends(get_current_user),
+):
+    """Return current AI Auto-Queue configuration for a guild."""
+    await verify_guild_access(guild_id, user)
+    return _ai_autoqueue_state.get(
+        guild_id,
+        {"enabled": False, "prompt": "", "count": 5, "threshold": 2},
+    )
+
+
+# ---------------------------------------------------------------------------
+# AI Auto-Queue background daemon
+# ---------------------------------------------------------------------------
+
+async def _ai_autoqueue_daemon() -> None:
+    """Background coroutine that monitors all guilds with AI Auto-Queue enabled.
+
+    Every 30 seconds it checks each configured guild's queue length. When the
+    queue falls below the configured threshold, it generates new suggestions
+    using the stored prompt and silently adds them to the queue.
+    """
+    logger.info("[AI AutoQueue] Daemon started.")
+    while not is_shutting_down:
+        try:
+            for guild_id, cfg in list(_ai_autoqueue_state.items()):
+                if not cfg.get("enabled") or not cfg.get("prompt"):
+                    continue
+                if not bot_instance:
+                    continue
+                guild = bot_instance.get_guild(int(guild_id))
+                if not guild:
+                    continue
+
+                state = bot_module.get_music_state(guild) or {}
+                queue_len = len(state.get("queue", []))
+                threshold = int(cfg.get("threshold", 2))
+                count = int(cfg.get("count", 5))
+                prompt = cfg["prompt"]
+
+                if queue_len < threshold:
+                    logger.info(
+                        "[AI AutoQueue] Guild %s: queue=%d < threshold=%d — auto-filling %d songs",
+                        guild_id, queue_len, threshold, count,
+                    )
+                    await _daemon_fill_queue(guild, prompt, count, state)
+        except Exception as exc:
+            logger.error("[AI AutoQueue] Daemon error: %s", exc, exc_info=True)
+
+        await asyncio.sleep(30)
+
+
+async def _daemon_fill_queue(guild, prompt: str, count: int, state: dict) -> None:
+    """Generate songs with Gemini and add them directly to the guild queue."""
+    recent: set[str] = {
+        (s.get("title") or "").lower().strip()
+        for s in state.get("queue", [])
+    }
+    if state.get("current_song"):
+        recent.add((state["current_song"].get("title") or "").lower().strip())
+
+    try:
+        queries = await ai_service.generate_search_queries(prompt, count=max(count * 2, 8))
+        songs = await ai_service.search_songs(
+            queries,
+            max_per_query=2,
+            blacklist_patterns=list(settings.YT_BLACKLIST_PATTERNS or []),
+            recent_titles=recent,
+        )
+    except Exception as exc:
+        logger.error("[AI AutoQueue] Failed to fetch suggestions: %s", exc)
+        return
+
+    added = 0
+    for song in songs[:count]:
+        url = song.get("url")
+        if not url:
+            continue
+        try:
+            # Build a headless (console) context the same way api.py does for non-user calls
+            console_author = bot_module.create_console_author()
+            console_author.display_name = "AI Auto-Queue"
+            console_author.name = "AI Auto-Queue"
+            state = bot_module.get_music_state(guild) or {}
+            text_channel = guild.get_channel(state.get("text_channel_id")) if state else None
+            ctx = bot_module.MusicContext(bot=bot_instance, guild=guild, channel=text_channel, author=console_author)
+            yt_command = bot_instance.get_command('yt')
+            if yt_command:
+                asyncio.create_task(yt_command.callback(ctx, query=url))
+                added += 1
+        except Exception as exc:
+            logger.warning("[AI AutoQueue] Could not add %r: %s", url, exc)
+
+    logger.info("[AI AutoQueue] Queued %d/%d AI songs for guild %s", added, count, guild.id)
+
+
 @app.post("/api/controls/{guild_id}/skip")
 async def skip_song(guild_id: str, user: dict = Depends(get_current_user)):
     guild = await verify_guild_access(guild_id, user)
@@ -442,8 +636,6 @@ async def skip_song(guild_id: str, user: dict = Depends(get_current_user)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-class IndexRequest(BaseModel):
-    index: int
 
 @app.post("/api/controls/{guild_id}/skipto")
 async def skipto_song(guild_id: str, req: IndexRequest, user: dict = Depends(get_current_user)):
@@ -584,6 +776,8 @@ def start_api_server(host="0.0.0.0", port=8000):
     )
     _api_server = uvicorn.Server(config)
     _api_task = asyncio.create_task(_api_server.serve())
+    # Start the AI Auto-Queue background daemon alongside the API server
+    asyncio.create_task(_ai_autoqueue_daemon())
 
 def stop_api_server():
     global _api_server, is_shutting_down
