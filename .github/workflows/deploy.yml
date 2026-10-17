@@ -10,6 +10,13 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
       - name: Deploy to Server via SSH
         env:
           ENV_SECRET: ${{ secrets.ENV }}
@@ -26,14 +33,20 @@ jobs:
           fi
 
           if [ -z "$SSH_USER" ]; then
-            SSH_USER="theanh"
+            echo "ERROR: SSH_USER not found in secret ENV!"
+            exit 1
+          fi
+
+          if [ -z "$SSH_PASSWORD" ]; then
+            echo "ERROR: SSH_PASSWORD not found in secret ENV!"
+            exit 1
           fi
 
           if [ -z "$SSH_PORT" ]; then
             SSH_PORT="22"
           fi
 
-          echo "Target host: $SSH_HOST (user: $SSH_USER, port: $SSH_PORT)"
+          echo "SSH configuration validated successfully."
 
           # 2. Install sshpass
           sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
@@ -42,10 +55,10 @@ jobs:
           echo "$ENV_SECRET" | tr -d '\r' | grep -v -E '^SSH_(HOST|USER|PASSWORD|PORT)=' > app.env
 
           # 4. Copy app.env to the server
-          SSHPASS="$SSH_PASSWORD" sshpass -e scp -o StrictHostKeyChecking=no -P "$SSH_PORT" app.env "$SSH_USER@$SSH_HOST:~/workspace/music-bot/.env.new"
+          SSHPASS="$SSH_PASSWORD" sshpass -e scp -o StrictHostKeyChecking=no -o ConnectTimeout=15 -P "$SSH_PORT" app.env "$SSH_USER@$SSH_HOST:~/workspace/music-bot/.env.new"
 
           # 5. Execute deployment commands remotely over SSH
-          SSHPASS="$SSH_PASSWORD" sshpass -e ssh -o StrictHostKeyChecking=no -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "
+          SSHPASS="$SSH_PASSWORD" sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "
             set -e
             echo '=== Starting Automated Deployment on Server ==='
             cd ~/workspace/music-bot || { echo 'Directory ~/workspace/music-bot not found!'; exit 1; }
