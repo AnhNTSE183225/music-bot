@@ -700,16 +700,17 @@ def set_music_volume(guild, volume):
         save_state_to_disk()
 
 
-def clear_music_state(guild):
+def clear_music_state(guild, disable_ai_auto=False):
     guild_id = getattr(guild, 'id', None)
     if guild_id:
         cancel_voice_recovery(guild_id)
-        try:
-            import api
-            if hasattr(api, 'disable_autoqueue'):
-                api.disable_autoqueue(guild_id)
-        except Exception:
-            pass
+        if disable_ai_auto:
+            try:
+                import api
+                if hasattr(api, 'disable_autoqueue'):
+                    api.disable_autoqueue(guild_id)
+            except Exception:
+                pass
     state = get_music_state(guild)
     if state is not None:
         state['queue'].clear()
@@ -3257,11 +3258,12 @@ async def stop(ctx):
             state['manual_stop'] = True
             state['is_playing'] = False
             state['was_playing'] = False
+            state['current_song'] = None
             state['voice_channel_id'] = None
             state['text_channel_id'] = None
+            state['valid_at'] = time.time()
             state['saved_at'] = time.time()
-
-        clear_music_state(ctx.guild)
+            save_state_to_disk()
 
         if ctx.voice_client:
             ctx.voice_client.stop()
