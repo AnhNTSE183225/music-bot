@@ -164,7 +164,7 @@ permissions:
       mode: "admin_only"
 
     ai_autoqueue:
-      mode: "vote_if_non_admin"
+      mode: "open"
       vote:
         threshold_type: "ratio"
         threshold_value: 0.5
