@@ -419,15 +419,6 @@ async def enforce_api_access(ctx, command_name: str):
     mode = bot_module.get_command_mode(command_name)
     if mode == 'admin_only' and not bot_module.is_admin_member(ctx.author):
         raise HTTPException(status_code=403, detail="Only administrators can use this command.")
-    if (
-        command_name == 'ai_autoqueue'
-        and mode == 'vote_if_non_admin'
-        and not bot_module.is_admin_member(ctx.author)
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail="Only administrators can configure AI Auto-Queue via API.",
-        )
 
 
 def format_song_for_api(song, guild):
