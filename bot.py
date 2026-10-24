@@ -2398,6 +2398,7 @@ async def enqueue_playlist_tracks(ctx, playlist_title, raw_entries):
         status_msg += f"\n⚠️ Playlist capped at maximum allowed {max_items} tracks."
 
     await ctx.send(status_msg)
+    return total_added
 
 
 async def check_and_prompt_playlist_on_the_side(ctx, playlist_url, enqueued_id, enqueued_title, single_video_url, initial_playlist_data=None):

@@ -15,6 +15,7 @@ bot_module = sys.modules.get('__main__')
 import settings
 import lyrics_service
 import ai_service
+import yt_query_logic
 import db
 
 # Initialize database schema
@@ -80,6 +81,24 @@ class VolumeRequest(BaseModel):
 
 class IndexRequest(BaseModel):
     index: int
+
+class PlaylistPreviewRequest(BaseModel):
+    url: str
+
+class PlaylistTrackItem(BaseModel):
+    url: str
+    title: str | None = None
+    artist: str | None = None
+    thumbnail: str | None = None
+    duration: float | None = None
+    index: int | None = None
+
+class AddPlaylistRequest(BaseModel):
+    url: str | None = None
+    title: str | None = "Playlist"
+    start_index: int = 1
+    end_index: int | None = None
+    tracks: list[PlaylistTrackItem] | None = None
 
 class ContributeKeyRequest(BaseModel):
     api_key: str
@@ -751,6 +770,183 @@ async def ai_confirm_batch(
 
     logger.info("[AI] Batch added %d/%d songs for guild %s", added, len(req.songs), guild_id)
     return {"status": "success", "added_count": added}
+
+
+# ---------------------------------------------------------------------------
+# Playlist Preview & Batch Add endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/playlist/{guild_id}/preview")
+async def preview_playlist(
+    guild_id: str,
+    req: PlaylistPreviewRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Preview playlist metadata and track listing for range selection before queueing."""
+    guild = await verify_guild_access(guild_id, user)
+    ctx = get_simulated_context(guild, user)
+    await enforce_api_access(ctx, 'yt')
+
+    if not req.url or not req.url.strip():
+        raise HTTPException(status_code=400, detail="Playlist URL is required.")
+
+    parsed = yt_query_logic.parse_youtube_url(req.url.strip())
+    if not parsed.get('is_playlist'):
+        raise HTTPException(status_code=400, detail="The provided link is not a valid YouTube playlist URL.")
+
+    list_id = parsed.get('list_id')
+    video_id = parsed.get('video_id')
+    if list_id and list_id.startswith('RD') and video_id:
+        target_url = f"https://www.youtube.com/watch?v={video_id}&list={list_id}"
+    elif list_id:
+        target_url = f"https://www.youtube.com/playlist?list={list_id}"
+    else:
+        target_url = parsed.get('playlist_url') or req.url.strip()
+
+    playlist_ytdl = getattr(bot_module, 'playlist_ytdl', None)
+    if not playlist_ytdl:
+        import yt_dlp
+        playlist_ytdl = yt_dlp.YoutubeDL(settings.PLAYLIST_YTDL_OPTIONS)
+
+    try:
+        data = await asyncio.to_thread(playlist_ytdl.extract_info, target_url, False)
+    except Exception as exc:
+        logger.error(f"Error extracting playlist: {exc}")
+        raise HTTPException(status_code=400, detail=f"Failed to fetch playlist: {exc}")
+
+    if not data or not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Could not retrieve playlist information.")
+
+    raw_entries = data.get('entries') or []
+    if not isinstance(raw_entries, (list, tuple)):
+        raw_entries = list(raw_entries)
+
+    entries = [e for e in raw_entries if e]
+    if not entries:
+        raise HTTPException(status_code=400, detail="The playlist is empty or unavailable.")
+
+    clean_thumb = getattr(bot_module, 'clean_thumbnail_url', None)
+
+    tracks = []
+    for i, e in enumerate(entries):
+        e_title = e.get('title') or f"Track {i + 1}"
+        e_id = e.get('id')
+        e_url = e.get('webpage_url') or e.get('url') or (f"https://www.youtube.com/watch?v={e_id}" if e_id else "")
+        raw_thumb = e.get('thumbnail')
+        if clean_thumb:
+            thumb = clean_thumb(raw_thumb, e_id)
+        else:
+            thumb = raw_thumb or (f"https://i.ytimg.com/vi/{e_id}/maxresdefault.jpg" if e_id else "")
+
+        artist = e.get('artist') or e.get('creator') or e.get('uploader') or e.get('channel') or ""
+        duration = e.get('duration') or 0
+
+        tracks.append({
+            "index": i + 1,
+            "id": e_id or str(i + 1),
+            "title": e_title,
+            "artist": artist,
+            "duration": duration,
+            "url": e_url,
+            "thumbnail": thumb or "",
+        })
+
+    playlist_thumb = data.get('thumbnail')
+    if clean_thumb and playlist_thumb:
+        playlist_thumb = clean_thumb(playlist_thumb)
+    if not playlist_thumb and tracks:
+        playlist_thumb = tracks[0]["thumbnail"]
+
+    return {
+        "title": data.get('title') or "YouTube Playlist",
+        "uploader": data.get('uploader') or data.get('channel') or "",
+        "thumbnail": playlist_thumb or "",
+        "total_tracks": len(tracks),
+        "tracks": tracks,
+    }
+
+
+@app.post("/api/playlist/{guild_id}/add")
+async def add_playlist(
+    guild_id: str,
+    req: AddPlaylistRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Enqueue selected range of songs from a playlist."""
+    guild = await verify_guild_access(guild_id, user)
+    ctx = get_simulated_context(guild, user)
+    await enforce_api_access(ctx, 'yt')
+
+    if not await bot_module.ensure_voice_connected(ctx):
+        raise HTTPException(status_code=400, detail="Bot is not connected to a voice channel.")
+
+    playlist_title = req.title or "YouTube Playlist"
+
+    # Case 1: Frontend supplied the tracks
+    if req.tracks:
+        selected_tracks = req.tracks
+        # If range indices provided and tracks contains the full list, slice it
+        if req.start_index and req.end_index and len(selected_tracks) > (req.end_index - req.start_index + 1):
+            s_idx = max(0, req.start_index - 1)
+            e_idx = max(s_idx, req.end_index)
+            selected_tracks = selected_tracks[s_idx:e_idx]
+
+        raw_entries = [
+            {
+                'title': t.title,
+                'url': t.url,
+                'webpage_url': t.url,
+                'artist': t.artist,
+                'thumbnail': t.thumbnail,
+                'duration': t.duration or 0,
+            }
+            for t in selected_tracks if t.url
+        ]
+    # Case 2: Frontend sent URL and range indices
+    elif req.url:
+        parsed = yt_query_logic.parse_youtube_url(req.url.strip())
+        list_id = parsed.get('list_id')
+        video_id = parsed.get('video_id')
+        if list_id and list_id.startswith('RD') and video_id:
+            target_url = f"https://www.youtube.com/watch?v={video_id}&list={list_id}"
+        elif list_id:
+            target_url = f"https://www.youtube.com/playlist?list={list_id}"
+        else:
+            target_url = parsed.get('playlist_url') or req.url.strip()
+
+        playlist_ytdl = getattr(bot_module, 'playlist_ytdl', None)
+        if not playlist_ytdl:
+            import yt_dlp
+            playlist_ytdl = yt_dlp.YoutubeDL(settings.PLAYLIST_YTDL_OPTIONS)
+
+        data = await asyncio.to_thread(playlist_ytdl.extract_info, target_url, False)
+        if not data or not isinstance(data, dict):
+            raise HTTPException(status_code=400, detail="Could not retrieve playlist information.")
+
+        playlist_title = data.get('title') or playlist_title
+        raw = data.get('entries') or []
+        if not isinstance(raw, (list, tuple)):
+            raw = list(raw)
+        entries = [e for e in raw if e]
+
+        start = max(1, req.start_index)
+        end = req.end_index or len(entries)
+        raw_entries = entries[start - 1 : end]
+    else:
+        raise HTTPException(status_code=400, detail="Either 'tracks' or 'url' must be provided.")
+
+    if not raw_entries:
+        raise HTTPException(status_code=400, detail="No tracks to add in the selected range.")
+
+    added_count = await bot_module.enqueue_playlist_tracks(ctx, playlist_title, raw_entries)
+    if added_count is None:
+        added_count = len(raw_entries)
+
+    return {
+        "status": "success",
+        "added_count": added_count,
+        "playlist_title": playlist_title,
+    }
 
 
 @app.post("/api/ai/{guild_id}/autoqueue")
