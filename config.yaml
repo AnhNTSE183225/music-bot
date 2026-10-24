@@ -172,6 +172,11 @@ permissions:
         same_channel_only: true
         force_vote_for_admin: false
 
+# Server Event & Calendar Schedule Settings
+schedule:
+  reminder_lead_time_minutes: 15     # Send Discord reminder N minutes before an event starts
+  announcement_channel: "general"    # Default text channel for server-wide event reminders
+
 # API & Web UI Settings
 api:
   host: "0.0.0.0"

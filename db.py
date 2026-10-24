@@ -78,7 +78,43 @@ def init_db():
             set_by_avatar TEXT,
             updated_at REAL NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS guild_schedule_events (
+            id TEXT PRIMARY KEY,
+            guild_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            category TEXT NOT NULL DEFAULT 'other',
+            start TEXT NOT NULL,
+            duration_minutes INTEGER NOT NULL DEFAULT 60,
+            recurrence_json TEXT,
+            location_json TEXT,
+            image_url TEXT,
+            links_json TEXT NOT NULL DEFAULT '[]',
+            organizer_id TEXT NOT NULL,
+            organizer_name TEXT NOT NULL DEFAULT '',
+            organizer_avatar TEXT,
+            invite_everyone INTEGER NOT NULL DEFAULT 1,
+            invitee_ids_json TEXT NOT NULL DEFAULT '[]',
+            series_responses_json TEXT NOT NULL DEFAULT '{}',
+            occurrence_responses_json TEXT NOT NULL DEFAULT '{}',
+            cancelled_occurrences_json TEXT NOT NULL DEFAULT '[]',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_guild_schedule_guild ON guild_schedule_events(guild_id);
+
+        CREATE TABLE IF NOT EXISTS guild_schedule_reminders (
+            event_id TEXT NOT NULL,
+            occurrence_key TEXT NOT NULL,
+            reminded_at REAL NOT NULL,
+            PRIMARY KEY (event_id, occurrence_key)
+        );
         """)
+        try:
+            conn.execute("ALTER TABLE guild_schedule_events ADD COLUMN category TEXT NOT NULL DEFAULT 'other'")
+        except Exception:
+            pass
     logger.info("[DB] Initialized database at %s", DB_PATH)
 
 
@@ -448,5 +484,237 @@ def load_autoqueue_config(guild_id: str | int) -> dict | None:
                 "set_by_avatar": row["set_by_avatar"],
             }
     return None
+
+
+# ---------------------------------------------------------------------------
+# Guild Schedule Operations
+# ---------------------------------------------------------------------------
+
+def _row_to_schedule_event(row) -> dict:
+    return {
+        "id": row["id"],
+        "guildId": row["guild_id"],
+        "title": row["title"],
+        "description": row["description"] or "",
+        "category": row["category"] if "category" in row.keys() else "other",
+        "start": row["start"],
+        "durationMinutes": row["duration_minutes"],
+        "recurrence": json.loads(row["recurrence_json"]) if row["recurrence_json"] else None,
+        "location": json.loads(row["location_json"]) if row["location_json"] else None,
+        "imageUrl": row["image_url"],
+        "links": json.loads(row["links_json"]) if row["links_json"] else [],
+        "organizerId": row["organizer_id"],
+        "organizerName": row["organizer_name"] or "",
+        "organizerAvatar": row["organizer_avatar"],
+        "inviteEveryone": bool(row["invite_everyone"]),
+        "inviteeIds": json.loads(row["invitee_ids_json"]) if row["invitee_ids_json"] else [],
+        "seriesResponses": json.loads(row["series_responses_json"]) if row["series_responses_json"] else {},
+        "occurrenceResponses": json.loads(row["occurrence_responses_json"]) if row["occurrence_responses_json"] else {},
+        "cancelledOccurrences": json.loads(row["cancelled_occurrences_json"]) if row["cancelled_occurrences_json"] else [],
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+    }
+
+
+def get_schedule_events(guild_id: str | int) -> list[dict]:
+    """Retrieve all scheduled events for a specific guild."""
+    gid = str(guild_id)
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM guild_schedule_events WHERE guild_id = ? ORDER BY start ASC",
+            (gid,),
+        ).fetchall()
+        return [_row_to_schedule_event(r) for r in rows]
+
+
+def get_schedule_event(event_id: str) -> dict | None:
+    """Retrieve a single scheduled event by ID."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM guild_schedule_events WHERE id = ?",
+            (event_id,),
+        ).fetchone()
+        return _row_to_schedule_event(row) if row else None
+
+
+def create_schedule_event(guild_id: str | int, data: dict, user_id: str, user_name: str, user_avatar: Optional[str] = None) -> dict:
+    """Create a new event in the guild schedule."""
+    gid = str(guild_id)
+    now = time.time()
+    event_id = f"ev-{int(now * 1000):x}"
+
+    title = (data.get("title") or "").strip()
+    description = (data.get("description") or "").strip()
+    category = (data.get("category") or "other").strip()
+    start = data.get("start") or ""
+    duration_minutes = int(data.get("durationMinutes", 60))
+    recurrence_json = json.dumps(data["recurrence"]) if data.get("recurrence") else None
+    location_json = json.dumps(data["location"]) if data.get("location") else None
+    image_url = data.get("imageUrl") or None
+    links_json = json.dumps(data.get("links") or [])
+    invite_everyone = 1 if data.get("inviteEveryone", True) else 0
+    invitee_ids_json = json.dumps(data.get("inviteeIds") or [])
+
+    # The organizer automatically accepts their own series
+    series_responses = {str(user_id): "accepted"}
+    series_responses_json = json.dumps(series_responses)
+    occurrence_responses_json = json.dumps({})
+    cancelled_occurrences_json = json.dumps([])
+
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO guild_schedule_events (
+                id, guild_id, title, description, category, start, duration_minutes,
+                recurrence_json, location_json, image_url, links_json,
+                organizer_id, organizer_name, organizer_avatar,
+                invite_everyone, invitee_ids_json,
+                series_responses_json, occurrence_responses_json, cancelled_occurrences_json,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_id, gid, title, description, category, start, duration_minutes,
+                recurrence_json, location_json, image_url, links_json,
+                str(user_id), user_name, user_avatar,
+                invite_everyone, invitee_ids_json,
+                series_responses_json, occurrence_responses_json, cancelled_occurrences_json,
+                now, now,
+            ),
+        )
+
+    return get_schedule_event(event_id)
+
+
+def update_schedule_event(event_id: str, data: dict, user_id: str, is_admin: bool = False) -> dict | None:
+    """Update an existing event. Only organizer or server admin can edit."""
+    existing = get_schedule_event(event_id)
+    if not existing:
+        return None
+
+    if existing["organizerId"] != str(user_id) and not is_admin:
+        raise PermissionError("Only the organizer or server admin can edit this event.")
+
+    now = time.time()
+    title = (data.get("title") or existing["title"]).strip()
+    description = data.get("description", existing["description"])
+    category = (data.get("category") or existing.get("category", "other")).strip()
+    start = data.get("start", existing["start"])
+    duration_minutes = int(data.get("durationMinutes", existing["durationMinutes"]))
+    recurrence_json = json.dumps(data["recurrence"]) if "recurrence" in data and data["recurrence"] else (
+        None if "recurrence" in data else json.dumps(existing["recurrence"]) if existing["recurrence"] else None
+    )
+    location_json = json.dumps(data["location"]) if "location" in data and data["location"] else (
+        None if "location" in data else json.dumps(existing["location"]) if existing["location"] else None
+    )
+    image_url = data.get("imageUrl", existing.get("imageUrl"))
+    links_json = json.dumps(data["links"]) if "links" in data else json.dumps(existing["links"])
+    invite_everyone = 1 if data.get("inviteEveryone", existing["inviteEveryone"]) else 0
+    invitee_ids_json = json.dumps(data["inviteeIds"]) if "inviteeIds" in data else json.dumps(existing["inviteeIds"])
+
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE guild_schedule_events SET
+                title = ?, description = ?, category = ?, start = ?, duration_minutes = ?,
+                recurrence_json = ?, location_json = ?, image_url = ?, links_json = ?,
+                invite_everyone = ?, invitee_ids_json = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                title, description, category, start, duration_minutes,
+                recurrence_json, location_json, image_url, links_json,
+                invite_everyone, invitee_ids_json, now, event_id,
+            ),
+        )
+
+    return get_schedule_event(event_id)
+
+
+def delete_schedule_event(event_id: str, user_id: str, is_admin: bool = False, occurrence: Optional[str] = None) -> bool:
+    """Delete an event or cancel a single occurrence of a recurring series."""
+    existing = get_schedule_event(event_id)
+    if not existing:
+        return False
+
+    if existing["organizerId"] != str(user_id) and not is_admin:
+        raise PermissionError("Only the organizer or server admin can delete this event.")
+
+    with get_connection() as conn:
+        if occurrence and existing.get("recurrence"):
+            cancelled = existing.get("cancelledOccurrences") or []
+            if occurrence not in cancelled:
+                cancelled.append(occurrence)
+            conn.execute(
+                "UPDATE guild_schedule_events SET cancelled_occurrences_json = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(cancelled), time.time(), event_id),
+            )
+            return True
+        else:
+            conn.execute("DELETE FROM guild_schedule_events WHERE id = ?", (event_id,))
+            return True
+
+
+def respond_schedule_event(event_id: str, user_id: str, key: str, status: str, scope: str = "occurrence") -> dict | None:
+    """Update RSVP status for a user (either for an occurrence or the whole series)."""
+    existing = get_schedule_event(event_id)
+    if not existing:
+        return None
+
+    uid = str(user_id)
+    now = time.time()
+    series_responses = existing.get("seriesResponses") or {}
+    occurrence_responses = existing.get("occurrenceResponses") or {}
+
+    if scope == "series" or not existing.get("recurrence"):
+        # Setting series response clears individual occurrence overrides for this user
+        for occ_k, user_map in list(occurrence_responses.items()):
+            if uid in user_map:
+                del user_map[uid]
+        series_responses[uid] = status
+    else:
+        if key not in occurrence_responses:
+            occurrence_responses[key] = {}
+        occurrence_responses[key][uid] = status
+
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE guild_schedule_events SET
+                series_responses_json = ?, occurrence_responses_json = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (json.dumps(series_responses), json.dumps(occurrence_responses), now, event_id),
+        )
+
+    return get_schedule_event(event_id)
+
+
+def get_all_active_schedule_events() -> list[dict]:
+    """Retrieve all scheduled events across all guilds for reminder checks."""
+    with get_connection() as conn:
+        rows = conn.execute("SELECT * FROM guild_schedule_events ORDER BY start ASC").fetchall()
+        return [_row_to_schedule_event(r) for r in rows]
+
+
+def is_occurrence_reminded(event_id: str, occurrence_key: str) -> bool:
+    """Check if a Discord reminder was already dispatched for an event occurrence."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM guild_schedule_reminders WHERE event_id = ? AND occurrence_key = ?",
+            (event_id, occurrence_key),
+        ).fetchone()
+        return bool(row)
+
+
+def mark_occurrence_reminded(event_id: str, occurrence_key: str) -> None:
+    """Mark an event occurrence reminder as sent."""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO guild_schedule_reminders (event_id, occurrence_key, reminded_at) VALUES (?, ?, ?)",
+            (event_id, occurrence_key, time.time()),
+        )
+
+
 
 

@@ -412,6 +412,11 @@ DISCORD_CLIENT_SECRET = os.getenv('DEV_DISCORD_CLIENT_SECRET') or os.getenv('DIS
 CORS_ORIGINS = _config.get('api', {}).get('cors_origins', [])
 EMPTY_VOICE_LEAVE_DELAY_SECONDS = int(os.getenv('MUSICBOT_EMPTY_VOICE_LEAVE_DELAY_SECONDS', _config.get('playback', {}).get('empty_voice_leave_delay_seconds', 10)))
 
+# --- Schedule Settings ---
+_schedule_cfg = _config.get('schedule', {}) or {}
+SCHEDULE_REMINDER_MINUTES = int(os.getenv('MUSICBOT_SCHEDULE_REMINDER_MINUTES', _schedule_cfg.get('reminder_lead_time_minutes', 15)))
+SCHEDULE_ANNOUNCEMENT_CHANNEL = str(os.getenv('MUSICBOT_SCHEDULE_ANNOUNCEMENT_CHANNEL', _schedule_cfg.get('announcement_channel', 'general'))).strip()
+
 # --- AI Service Configuration ---
 def get_ai_config() -> dict:
     """Return dictionary of AI configuration parameters from config file."""

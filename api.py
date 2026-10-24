@@ -3,6 +3,7 @@ import asyncio
 import logging
 from uuid import uuid4
 import urllib.parse
+from typing import Optional
 
 from fastapi import FastAPI, Request, Response, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -393,6 +394,49 @@ async def get_voice_status(user: dict = Depends(get_current_user)):
                         })
             
     return {"sessions": active_sessions}
+
+@app.get("/api/guilds")
+async def get_user_guilds(user: dict = Depends(get_current_user)):
+    user_id = int(user["user"]["id"])
+    user_guild_ids = {str(g["id"]) for g in user.get("guilds", [])}
+    guild_list = []
+    
+    for guild in (bot_instance.guilds if bot_instance else []):
+        if not user_guild_ids or str(guild.id) in user_guild_ids:
+            member = guild.get_member(user_id)
+            is_admin = bot_module.is_admin_member(member) if (member and bot_module) else False
+            
+            channel_id = None
+            channel_name = None
+            bot_connected = False
+            
+            if member and member.voice and member.voice.channel:
+                channel_id = str(member.voice.channel.id)
+                channel_name = member.voice.channel.name
+                bot_connected = guild.voice_client is not None and guild.voice_client.channel.id == member.voice.channel.id
+            else:
+                for vc in guild.voice_channels:
+                    for vc_member in vc.members:
+                        if vc_member.id == user_id:
+                            channel_id = str(vc.id)
+                            channel_name = vc.name
+                            bot_connected = guild.voice_client is not None and guild.voice_client.channel.id == vc.id
+                            break
+                    if channel_id:
+                        break
+                        
+            icon_url = str(guild.icon.url) if getattr(guild, 'icon', None) else None
+            guild_list.append({
+                "id": str(guild.id),
+                "name": guild.name,
+                "icon": icon_url,
+                "channel_id": channel_id,
+                "channel_name": channel_name,
+                "bot_connected": bot_connected,
+                "is_admin": is_admin
+            })
+            
+    return {"guilds": guild_list}
 
 async def verify_guild_access(guild_id: str, user: dict):
     user_guilds = [str(g["id"]) for g in user["guilds"]]
@@ -1264,6 +1308,159 @@ async def change_volume(guild_id: str, req: VolumeRequest, user: dict = Depends(
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Schedule Endpoints
+# ---------------------------------------------------------------------------
+
+def get_guild_members_list(guild) -> list[dict]:
+    """Return all non-bot members of the guild with id, display name, and avatar."""
+    members = []
+    if guild and hasattr(guild, "members"):
+        for m in guild.members:
+            if not getattr(m, "bot", False):
+                avatar = ""
+                if getattr(m, "display_avatar", None):
+                    avatar = str(m.display_avatar.url)
+                elif getattr(m, "avatar", None):
+                    avatar = str(m.avatar.url)
+                members.append({
+                    "id": str(m.id),
+                    "name": getattr(m, "display_name", None) or m.name,
+                    "avatar": avatar,
+                })
+    return members
+
+
+def get_guild_voice_channels_list(guild) -> list[dict]:
+    """Return all voice and stage channels in the guild."""
+    channels = []
+    if guild and hasattr(guild, "voice_channels"):
+        for vc in guild.voice_channels:
+            channels.append({
+                "id": str(vc.id),
+                "name": vc.name,
+                "type": "voice",
+            })
+        for sc in getattr(guild, "stage_channels", []):
+            channels.append({
+                "id": str(sc.id),
+                "name": sc.name,
+                "type": "stage",
+            })
+    return channels
+
+
+@app.get("/api/guild/{guild_id}/members")
+async def get_guild_members(guild_id: str, user: dict = Depends(get_current_user)):
+    guild = await verify_guild_access(guild_id, user)
+    return {"members": get_guild_members_list(guild)}
+
+
+@app.get("/api/guild/{guild_id}/channels")
+async def get_guild_channels(guild_id: str, user: dict = Depends(get_current_user)):
+    guild = await verify_guild_access(guild_id, user)
+    return {"channels": get_guild_voice_channels_list(guild)}
+
+
+@app.get("/api/schedule/{guild_id}")
+async def get_schedule(guild_id: str, user: dict = Depends(get_current_user)):
+    guild = await verify_guild_access(guild_id, user)
+    events = db.get_schedule_events(guild_id)
+    members = get_guild_members_list(guild)
+    channels = get_guild_voice_channels_list(guild)
+    return {
+        "events": events,
+        "members": members,
+        "channels": channels,
+    }
+
+
+@app.post("/api/schedule/{guild_id}")
+async def create_schedule(guild_id: str, payload: dict, user: dict = Depends(get_current_user)):
+    guild = await verify_guild_access(guild_id, user)
+    user_info = user.get("user", {})
+    user_id = str(user_info.get("id", ""))
+    user_name = user_info.get("global_name") or user_info.get("username") or "Member"
+    avatar = (
+        f"https://cdn.discordapp.com/avatars/{user_id}/{user_info.get('avatar')}.png?size=64"
+        if user_info.get("avatar")
+        else ""
+    )
+
+    event = db.create_schedule_event(guild_id, payload, user_id, user_name, avatar)
+    return {"status": "ok", "event": event}
+
+
+@app.put("/api/schedule/{guild_id}/{event_id}")
+async def update_schedule(guild_id: str, event_id: str, payload: dict, user: dict = Depends(get_current_user)):
+    guild = await verify_guild_access(guild_id, user)
+    user_info = user.get("user", {})
+    user_id = str(user_info.get("id", ""))
+
+    is_admin = False
+    if guild and bot_module:
+        try:
+            member = guild.get_member(int(user_id))
+            if member:
+                is_admin = bot_module.is_admin_member(member)
+        except Exception:
+            pass
+
+    try:
+        updated = db.update_schedule_event(event_id, payload, user_id, is_admin=is_admin)
+        if not updated:
+            raise HTTPException(status_code=404, detail="Event not found")
+        return {"status": "ok", "event": updated}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+
+
+@app.delete("/api/schedule/{guild_id}/{event_id}")
+async def delete_schedule(
+    guild_id: str,
+    event_id: str,
+    occurrence: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    guild = await verify_guild_access(guild_id, user)
+    user_info = user.get("user", {})
+    user_id = str(user_info.get("id", ""))
+
+    is_admin = False
+    if guild and bot_module:
+        try:
+            member = guild.get_member(int(user_id))
+            if member:
+                is_admin = bot_module.is_admin_member(member)
+        except Exception:
+            pass
+
+    try:
+        deleted = db.delete_schedule_event(event_id, user_id, is_admin=is_admin, occurrence=occurrence)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Event not found")
+        return {"status": "ok"}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+
+
+@app.post("/api/schedule/{guild_id}/{event_id}/respond")
+async def respond_schedule(guild_id: str, event_id: str, payload: dict, user: dict = Depends(get_current_user)):
+    await verify_guild_access(guild_id, user)
+    user_info = user.get("user", {})
+    user_id = str(user_info.get("id", ""))
+
+    key = payload.get("key", "")
+    status = payload.get("status", "accepted")
+    scope = payload.get("scope", "occurrence")
+
+    updated = db.respond_schedule_event(event_id, user_id, key, status, scope)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Event not found")
+    return {"status": "ok", "event": updated}
+
 
 _api_server = None
 _api_task = None

@@ -2101,8 +2101,11 @@ async def play_next(ctx):
 
 # --- EVENTS ---
 
+schedule_reminder_task = None
+
 @bot.event
 async def on_ready():
+    global schedule_reminder_task
     logger.info(f'Logged in as {bot.user}')
     start_console_command_bridge()
     try:
@@ -2111,6 +2114,15 @@ async def on_ready():
             api.reset_all_autoqueue()
     except Exception:
         pass
+
+    if schedule_reminder_task is None or schedule_reminder_task.done():
+        try:
+            import schedule_service
+            schedule_reminder_task = asyncio.create_task(schedule_service.run_schedule_reminder_loop(bot))
+            logger.info('Started schedule reminder background task.')
+        except Exception as e:
+            logger.error('Failed to start schedule reminder task: %s', e)
+
     if settings.AUTO_RESUME_PLAYBACK:
         await check_and_resume_all_sessions()
 
