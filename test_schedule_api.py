@@ -101,9 +101,15 @@ def test_schedule_db_and_api():
         assert len(upcoming) == 1
         occ_key = upcoming[0]["key"]
 
-        assert not db.is_occurrence_reminded(rem_id, occ_key)
-        db.mark_occurrence_reminded(rem_id, occ_key)
-        assert db.is_occurrence_reminded(rem_id, occ_key)
+        # Default reminder_type="lead"
+        assert not db.is_occurrence_reminded(rem_id, occ_key, "lead")
+        db.mark_occurrence_reminded(rem_id, occ_key, "lead")
+        assert db.is_occurrence_reminded(rem_id, occ_key, "lead")
+
+        # Starting-now reminder_type="start" is tracked independently
+        assert not db.is_occurrence_reminded(rem_id, occ_key, "start")
+        db.mark_occurrence_reminded(rem_id, occ_key, "start")
+        assert db.is_occurrence_reminded(rem_id, occ_key, "start")
     finally:
         db.delete_schedule_event(rem_id, user_id)
 

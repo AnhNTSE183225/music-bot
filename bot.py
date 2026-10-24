@@ -84,7 +84,7 @@ file_handler = RotatingFileHandler(
 file_handler.setLevel(getattr(logging, settings.LOG_LEVEL, logging.INFO))
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
+# Attach file_handler to root logger only; child loggers propagate up to root
 logging.getLogger().addHandler(file_handler)
 
 # In production mode, silence high-frequency uvicorn endpoint polling (e.g. /api/queue, /api/playback)
@@ -3580,12 +3580,11 @@ async def setup_hook():
         ensure_loop_lag_monitor()
         load_state_from_disk()
         
-        # Start API server
+        # Ensure API server is initialized and running
         try:
             import api
             api.set_bot(bot)
             api.start_api_server(host=getattr(settings, "API_HOST", "0.0.0.0"), port=getattr(settings, "API_PORT", 8000))
-            logger.info("API Server started successfully.")
         except Exception as api_err:
             logger.error(f"Failed to start API server: {api_err}", exc_info=True)
 
@@ -3671,6 +3670,15 @@ async def main():
             signal.signal(signal.SIGBREAK, handle_signal)
         except Exception:
             pass
+
+    # Start API server immediately so web UI / Tailscale can connect without waiting for Discord gateway
+    try:
+        import api
+        api.set_bot(bot)
+        api.start_api_server(host=getattr(settings, "API_HOST", "0.0.0.0"), port=getattr(settings, "API_PORT", 8000))
+        logger.info("API Server started successfully.")
+    except Exception as api_err:
+        logger.error(f"Failed to start API server: {api_err}", exc_info=True)
 
     while True:
         try:

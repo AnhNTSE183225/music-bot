@@ -175,15 +175,39 @@ else
 fi
 
 # Starting Bot in Background (stops any existing instance first)
-if [ -f bot.pid ] && kill -0 $(cat bot.pid) 2>/dev/null; then
-    OLD_PID=$(cat bot.pid)
-    echo -e "\e[33mStopping existing MusicBot process (PID $OLD_PID)...\e[0m"
-    kill $OLD_PID 2>/dev/null || true
-    sleep 2
-    if kill -0 $OLD_PID 2>/dev/null; then
-        kill -9 $OLD_PID 2>/dev/null || true
+CURRENT_PID=$$
+if [ -f bot.pid ]; then
+    OLD_PID=$(cat bot.pid 2>/dev/null || true)
+    if [ -n "$OLD_PID" ] && kill -0 $OLD_PID 2>/dev/null; then
+        echo -e "\e[33mStopping existing MusicBot process (PID $OLD_PID)...\e[0m"
+        kill $OLD_PID 2>/dev/null || true
+        WAIT_COUNT=0
+        while kill -0 $OLD_PID 2>/dev/null && [ $WAIT_COUNT -lt 4 ]; do
+            sleep 1
+            WAIT_COUNT=$((WAIT_COUNT + 1))
+        done
+        if kill -0 $OLD_PID 2>/dev/null; then
+            kill -9 $OLD_PID 2>/dev/null || true
+            sleep 1
+        fi
+        echo -e "\e[32mOK: Previous process stopped.\e[0m"
     fi
-    echo -e "\e[32mOK: Previous process stopped.\e[0m"
+    rm -f bot.pid
+fi
+
+# Clean up any lingering orphan bot.py processes
+REMAINING_BOT_PIDS=$(ps -ef | grep '[b]ot\.py' | awk '{print $2}' || true)
+if [ -n "$REMAINING_BOT_PIDS" ]; then
+    for pid in $REMAINING_BOT_PIDS; do
+        if [ "$pid" != "$CURRENT_PID" ]; then
+            kill -9 $pid 2>/dev/null || true
+        fi
+    done
+fi
+
+# Ensure port 8000 is released before launching
+if command -v fuser >/dev/null 2>&1; then
+    fuser -k 8000/tcp >/dev/null 2>&1 || true
 fi
 
 echo -e "\e[36mStarting bot in the background...\e[0m"
@@ -201,14 +225,33 @@ fi
 echo -e "\e[32mBot started (PID $BOT_PID)! Runner log: $LOGS_DIR/bot_runner.log, App log: $MUSICBOT_LOG_FILE\e[0m"
 
 # Starting Tailscale Funnel in Background
-if [ -f tailscale_funnel.pid ] && kill -0 $(cat tailscale_funnel.pid) 2>/dev/null; then
-    echo -e "\e[33mTailscale Funnel is already running (PID $(cat tailscale_funnel.pid)).\e[0m"
+TS_RUNNING=false
+if [ -f tailscale_funnel.pid ]; then
+    TS_PID=$(cat tailscale_funnel.pid 2>/dev/null || true)
+    if [ -n "$TS_PID" ] && kill -0 $TS_PID 2>/dev/null; then
+        TS_RUNNING=true
+    fi
+fi
+
+if [ "$TS_RUNNING" = false ]; then
+    ACTIVE_TS_PID=$(pgrep -f "tailscale funnel.*8000" | head -n 1 || true)
+    if [ -n "$ACTIVE_TS_PID" ]; then
+        echo $ACTIVE_TS_PID > tailscale_funnel.pid
+        TS_RUNNING=true
+    fi
+fi
+
+if [ "$TS_RUNNING" = true ]; then
+    echo -e "\e[33mTailscale Funnel is already running (PID $(cat tailscale_funnel.pid 2>/dev/null)).\e[0m"
 else
     echo -e "\e[36mStarting Tailscale Funnel on port 8000...\e[0m"
     # Refresh sudo credentials if available without blocking CI
     sudo -n -v 2>/dev/null || true
     (sudo -n tailscale funnel 8000 2>/dev/null || tailscale funnel 8000) > "$LOGS_DIR/tailscale_funnel.log" 2>&1 &
-    echo $! > tailscale_funnel.pid
+    TS_SUB_PID=$!
+    sleep 1
+    ACTUAL_TS_PID=$(pgrep -f "tailscale funnel.*8000" | head -n 1 || true)
+    echo "${ACTUAL_TS_PID:-$TS_SUB_PID}" > tailscale_funnel.pid
     echo -e "\e[32mTailscale funnel started! Logs are in $LOGS_DIR/tailscale_funnel.log\e[0m"
 fi
 

@@ -42,9 +42,9 @@ fi
 sudo -n -v 2>/dev/null || true
 if [ -f tailscale_funnel.pid ]; then
     TS_PID=$(cat tailscale_funnel.pid 2>/dev/null || true)
-    if [ -n "$TS_PID" ] && sudo -n kill -0 $TS_PID 2>/dev/null; then
+    if [ -n "$TS_PID" ]; then
         echo -e "\e[33mStopping Tailscale Funnel (PID $TS_PID)...\e[0m"
-        sudo -n kill -9 $TS_PID 2>/dev/null || true
+        kill -9 $TS_PID 2>/dev/null || sudo -n kill -9 $TS_PID 2>/dev/null || true
         echo -e "\e[32mTailscale Funnel stopped.\e[0m"
     fi
     rm -f tailscale_funnel.pid
@@ -55,9 +55,14 @@ REMAINING_TS=$(ps -ef | grep '[t]ailscale funnel' | awk '{print $2}' || true)
 if [ -n "$REMAINING_TS" ]; then
     for pid in $REMAINING_TS; do
         if [ "$pid" != "$CURRENT_PID" ]; then
-            sudo -n kill -9 $pid 2>/dev/null || true
+            kill -9 $pid 2>/dev/null || sudo -n kill -9 $pid 2>/dev/null || true
         fi
     done
+fi
+
+# 4. Release port 8000 if bound
+if command -v fuser >/dev/null 2>&1; then
+    fuser -k 8000/tcp >/dev/null 2>&1 || true
 fi
 
 echo -e "\n\e[32mAll services stopped successfully!\e[0m"

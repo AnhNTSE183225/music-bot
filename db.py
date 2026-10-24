@@ -107,14 +107,11 @@ def init_db():
         CREATE TABLE IF NOT EXISTS guild_schedule_reminders (
             event_id TEXT NOT NULL,
             occurrence_key TEXT NOT NULL,
+            reminder_type TEXT NOT NULL DEFAULT 'lead',
             reminded_at REAL NOT NULL,
-            PRIMARY KEY (event_id, occurrence_key)
+            PRIMARY KEY (event_id, occurrence_key, reminder_type)
         );
         """)
-        try:
-            conn.execute("ALTER TABLE guild_schedule_events ADD COLUMN category TEXT NOT NULL DEFAULT 'other'")
-        except Exception:
-            pass
     logger.info("[DB] Initialized database at %s", DB_PATH)
 
 
@@ -697,22 +694,22 @@ def get_all_active_schedule_events() -> list[dict]:
         return [_row_to_schedule_event(r) for r in rows]
 
 
-def is_occurrence_reminded(event_id: str, occurrence_key: str) -> bool:
-    """Check if a Discord reminder was already dispatched for an event occurrence."""
+def is_occurrence_reminded(event_id: str, occurrence_key: str, reminder_type: str = "lead") -> bool:
+    """Check if a Discord reminder was already dispatched for an event occurrence and reminder type."""
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT 1 FROM guild_schedule_reminders WHERE event_id = ? AND occurrence_key = ?",
-            (event_id, occurrence_key),
+            "SELECT 1 FROM guild_schedule_reminders WHERE event_id = ? AND occurrence_key = ? AND reminder_type = ?",
+            (event_id, occurrence_key, reminder_type),
         ).fetchone()
         return bool(row)
 
 
-def mark_occurrence_reminded(event_id: str, occurrence_key: str) -> None:
-    """Mark an event occurrence reminder as sent."""
+def mark_occurrence_reminded(event_id: str, occurrence_key: str, reminder_type: str = "lead") -> None:
+    """Mark an event occurrence reminder as sent for a specific reminder type."""
     with get_connection() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO guild_schedule_reminders (event_id, occurrence_key, reminded_at) VALUES (?, ?, ?)",
-            (event_id, occurrence_key, time.time()),
+            "INSERT OR REPLACE INTO guild_schedule_reminders (event_id, occurrence_key, reminder_type, reminded_at) VALUES (?, ?, ?, ?)",
+            (event_id, occurrence_key, reminder_type, time.time()),
         )
 
 
