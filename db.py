@@ -487,6 +487,22 @@ def load_autoqueue_config(guild_id: str | int) -> dict | None:
 # Guild Schedule Operations
 # ---------------------------------------------------------------------------
 
+def normalize_iso_datetime(dt_str: str) -> str:
+    """Normalize any datetime string to full ISO 8601 with timezone (UTC)."""
+    if not dt_str:
+        return ""
+    cleaned = dt_str.replace("Z", "+00:00")
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(cleaned)
+        if dt.tzinfo is None:
+            # Naive datetime: interpret in local system timezone, then convert to aware UTC
+            dt = dt.astimezone()
+        return dt.astimezone(timezone.utc).isoformat()
+    except Exception:
+        return dt_str
+
+
 def _row_to_schedule_event(row) -> dict:
     return {
         "id": row["id"],
@@ -543,7 +559,7 @@ def create_schedule_event(guild_id: str | int, data: dict, user_id: str, user_na
     title = (data.get("title") or "").strip()
     description = (data.get("description") or "").strip()
     category = (data.get("category") or "other").strip()
-    start = data.get("start") or ""
+    start = normalize_iso_datetime(data.get("start") or "")
     duration_minutes = int(data.get("durationMinutes", 60))
     recurrence_json = json.dumps(data["recurrence"]) if data.get("recurrence") else None
     location_json = json.dumps(data["location"]) if data.get("location") else None
@@ -596,7 +612,7 @@ def update_schedule_event(event_id: str, data: dict, user_id: str, is_admin: boo
     title = (data.get("title") or existing["title"]).strip()
     description = data.get("description", existing["description"])
     category = (data.get("category") or existing.get("category", "other")).strip()
-    start = data.get("start", existing["start"])
+    start = normalize_iso_datetime(data.get("start", existing["start"]))
     duration_minutes = int(data.get("durationMinutes", existing["durationMinutes"]))
     recurrence_json = json.dumps(data["recurrence"]) if "recurrence" in data and data["recurrence"] else (
         None if "recurrence" in data else json.dumps(existing["recurrence"]) if existing["recurrence"] else None

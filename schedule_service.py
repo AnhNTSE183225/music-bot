@@ -19,7 +19,9 @@ def parse_datetime(dt_str: str) -> datetime:
     cleaned = dt_str.replace("Z", "+00:00")
     dt = datetime.fromisoformat(cleaned)
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        # Naive datetime (e.g. from local input "YYYY-MM-DDTHH:MM"):
+        # Interpret in local system timezone and convert to aware UTC
+        dt = dt.astimezone()
     return dt.astimezone(timezone.utc)
 
 
@@ -47,7 +49,8 @@ def get_upcoming_occurrences(event: Dict[str, Any], window_start: datetime, wind
     # One-off event
     if not recurrence or not recurrence.get("freq") or recurrence.get("freq") == "none":
         key = dt_start.strftime("%Y-%m-%dT%H:%M:%SZ")
-        if key not in cancelled and (window_start <= dt_start <= window_end):
+        date_key = dt_start.strftime("%Y-%m-%d")
+        if key not in cancelled and date_key not in cancelled and (window_start <= dt_start <= window_end):
             results.append({
                 "key": key,
                 "start": dt_start,
@@ -81,6 +84,7 @@ def get_upcoming_occurrences(event: Dict[str, Any], window_start: datetime, wind
             break
 
         key = current.strftime("%Y-%m-%dT%H:%M:%SZ")
+        date_key = current.strftime("%Y-%m-%d")
         is_match = False
 
         if freq == "daily":
@@ -96,7 +100,7 @@ def get_upcoming_occurrences(event: Dict[str, Any], window_start: datetime, wind
 
         if is_match:
             generated_count += 1
-            if key not in cancelled and (window_start <= current <= window_end):
+            if key not in cancelled and date_key not in cancelled and (window_start <= current <= window_end):
                 results.append({
                     "key": key,
                     "start": current,
